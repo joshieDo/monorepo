@@ -1204,6 +1204,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "futures",
+ "paste",
  "pin-project",
  "prometheus-client",
  "rand 0.8.5",
