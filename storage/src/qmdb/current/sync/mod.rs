@@ -177,7 +177,7 @@ where
     // init_from_log replays the operations, building the snapshot (index) and invoking
     // our callback for each operation to populate the bitmap.
     let known_inactivity_floor = Location::new_unchecked(status.len());
-    let any: AnyDb<E, J, I, H, U, _> = AnyDb::init_from_log(
+    let any: AnyDb<E, J, I, H, U> = AnyDb::init_from_log(
         index,
         log,
         Some(known_inactivity_floor),
@@ -258,6 +258,7 @@ where
         thread_pool,
         dirty_chunks: std::collections::HashSet::new(),
         root,
+        _durable_state: core::marker::PhantomData,
     };
 
     // Persist metadata so the db can be reopened with init_fixed/init_variable.

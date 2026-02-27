@@ -27,7 +27,7 @@ use crate::{
             proof::{OperationProof, RangeProof},
         },
         operation::Key,
-        store::{self, LogStore, MerkleizedStore, PrunableStore},
+        store::{LogStore, MerkleizedStore, PrunableStore},
         DurabilityState, Durable, Error, NonDurable,
     },
     Persistable,
@@ -61,7 +61,7 @@ pub struct Db<
 > {
     /// An authenticated database that provides the ability to prove whether a key ever had a
     /// specific value.
-    pub(super) any: any::db::Db<E, C, I, H, U, D>,
+    pub(super) any: any::db::Db<E, C, I, H, U>,
 
     /// The bitmap over the activity status of each operation. Supports augmenting [Db] proofs in
     /// order to further prove whether a key _currently_ has a specific value.
@@ -91,6 +91,10 @@ pub struct Db<
     /// The cached canonical root.
     /// See the [Root structure](super) section in the module documentation.
     pub(super) root: DigestOf<H>,
+
+    /// Marker for the durability state parameter. The inner `any::db::Db` no longer
+    /// carries D, but `current::Db` still uses D to gate which methods are available.
+    pub(super) _durable_state: core::marker::PhantomData<D>,
 }
 
 // Functionality shared across all DB states, such as most non-mutating operations.
@@ -332,13 +336,14 @@ where
     /// Convert this database into a mutable state.
     pub fn into_mutable(self) -> Db<E, C, I, H, U, N, NonDurable> {
         Db {
-            any: self.any.into_mutable(),
+            any: self.any,
             status: self.status,
             grafted_mmr: self.grafted_mmr,
             metadata: self.metadata,
             thread_pool: self.thread_pool,
             dirty_chunks: HashSet::new(),
             root: self.root,
+            _durable_state: core::marker::PhantomData,
         }
     }
 }
@@ -404,16 +409,8 @@ where
     ) -> Result<(Db<E, C, I, H, U, N, Durable>, Range<Location>), Error> {
         let range = self.apply_commit_op(metadata).await?;
 
-        // Transition to Durable state.
-        let mut any = any::db::Db {
-            log: self.any.log,
-            inactivity_floor_loc: self.any.inactivity_floor_loc,
-            last_commit_loc: self.any.last_commit_loc,
-            snapshot: self.any.snapshot,
-            durable_state: store::Durable,
-            active_keys: self.any.active_keys,
-            _update: core::marker::PhantomData,
-        };
+        // The inner any::Db is always the same type (no durability state parameter).
+        let mut any = self.any;
 
         // Merkleize: compute grafted leaves for new/dirty bitmap chunks.
         let old_grafted_leaves = *self.grafted_mmr.leaves() as usize;
@@ -481,6 +478,7 @@ where
                 thread_pool: self.thread_pool,
                 dirty_chunks: HashSet::new(),
                 root,
+                _durable_state: core::marker::PhantomData,
             },
             range,
         ))

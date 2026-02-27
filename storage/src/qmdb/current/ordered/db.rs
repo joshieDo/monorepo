@@ -108,7 +108,7 @@ where
                     // The provided `key` is in the DB if it matches the start of the span.
                     return false;
                 }
-                if !crate::qmdb::any::db::Db::<E, C, I, H, Update<K, V>, D>::span_contains(
+                if !crate::qmdb::any::db::Db::<E, C, I, H, Update<K, V>>::span_contains(
                     &data.key,
                     &data.next_key,
                     key,

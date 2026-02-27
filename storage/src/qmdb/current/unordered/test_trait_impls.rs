@@ -61,7 +61,7 @@ impl<
     }
 
     fn steps(&self) -> u64 {
-        self.any.durable_state.steps
+        self.any.steps
     }
 }
 
@@ -107,7 +107,7 @@ where
     }
 
     fn steps(&self) -> u64 {
-        self.any.durable_state.steps
+        self.any.steps
     }
 }
 
@@ -201,7 +201,7 @@ impl<
     }
 
     fn steps(&self) -> u64 {
-        self.any.durable_state.steps
+        self.any.steps
     }
 }
 
@@ -272,7 +272,7 @@ where
     }
 
     fn steps(&self) -> u64 {
-        self.any.durable_state.steps
+        self.any.steps
     }
 }
 

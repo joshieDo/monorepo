@@ -12,7 +12,7 @@ use crate::{
     qmdb::{
         any::{init_variable, ordered, value::VariableEncoding, VariableConfig, VariableValue},
         operation::Key,
-        Durable, Error,
+        Error,
     },
     translator::Translator,
 };
@@ -25,11 +25,11 @@ pub type Operation<K, V> = ordered::Operation<K, VariableEncoding<V>>;
 
 /// A key-value QMDB based on an authenticated log of operations, supporting authentication of any
 /// value ever associated with a key.
-pub type Db<E, K, V, H, T, D = Durable> =
-    super::Db<E, Journal<E, Operation<K, V>>, Index<T, Location>, H, Update<K, V>, D>;
+pub type Db<E, K, V, H, T> =
+    super::Db<E, Journal<E, Operation<K, V>>, Index<T, Location>, H, Update<K, V>>;
 
 impl<E: Storage + Clock + Metrics, K: Key, V: VariableValue, H: Hasher, T: Translator>
-    Db<E, K, V, H, T, Durable>
+    Db<E, K, V, H, T>
 where
     Operation<K, V>: Codec,
 {
@@ -75,7 +75,7 @@ pub mod partitioned {
         qmdb::{
             any::{init_variable, VariableConfig, VariableValue},
             operation::Key,
-            Durable, Error,
+            Error,
         },
         translator::Translator,
     };
@@ -92,13 +92,12 @@ pub mod partitioned {
     ///
     /// Use partitioned indices when you have a large number of keys (>> 2^(P*8)) and memory
     /// efficiency is important. Keys should be uniformly distributed across the prefix space.
-    pub type Db<E, K, V, H, T, const P: usize, D = Durable> = crate::qmdb::any::ordered::Db<
+    pub type Db<E, K, V, H, T, const P: usize> = crate::qmdb::any::ordered::Db<
         E,
         Journal<E, Operation<K, V>>,
         Index<T, Location, P>,
         H,
         Update<K, V>,
-        D,
     >;
 
     impl<
@@ -108,7 +107,7 @@ pub mod partitioned {
             H: Hasher,
             T: Translator,
             const P: usize,
-        > Db<E, K, V, H, T, P, Durable>
+        > Db<E, K, V, H, T, P>
     where
         Operation<K, V>: Codec,
     {
@@ -143,13 +142,13 @@ pub mod partitioned {
     /// Convenience type aliases for 256 partitions (P=1).
     pub mod p256 {
         /// Variable-value DB with 256 partitions.
-        pub type Db<E, K, V, H, T, D = crate::qmdb::Durable> = super::Db<E, K, V, H, T, 1, D>;
+        pub type Db<E, K, V, H, T> = super::Db<E, K, V, H, T, 1>;
     }
 
     /// Convenience type aliases for 65,536 partitions (P=2).
     pub mod p64k {
         /// Variable-value DB with 65,536 partitions.
-        pub type Db<E, K, V, H, T, D = crate::qmdb::Durable> = super::Db<E, K, V, H, T, 2, D>;
+        pub type Db<E, K, V, H, T> = super::Db<E, K, V, H, T, 2>;
     }
 }
 
@@ -171,7 +170,6 @@ pub(crate) mod test {
                 test::variable_db_config,
             },
             store::tests::{assert_log_store, assert_merkleized_store, assert_prunable_store},
-            Durable, NonDurable,
         },
         translator::TwoCap,
     };
@@ -194,8 +192,7 @@ pub(crate) mod test {
         VariableConfig<TwoCap, ((), (commonware_codec::RangeCfg<usize>, ()))>;
 
     /// Type aliases for concrete [Db] types used in these unit tests.
-    pub(crate) type AnyTest = Db<deterministic::Context, Digest, Vec<u8>, Sha256, TwoCap, Durable>;
-    type MutableAnyTest = Db<deterministic::Context, Digest, Vec<u8>, Sha256, TwoCap, NonDurable>;
+    pub(crate) type AnyTest = Db<deterministic::Context, Digest, Vec<u8>, Sha256, TwoCap>;
 
     pub(crate) fn create_test_config(seed: u64, pooler: &impl BufferPooler) -> VarConfig {
         VariableConfig {
@@ -259,7 +256,7 @@ pub(crate) mod test {
     }
 
     /// Applies the given operations to the database.
-    pub(crate) async fn apply_ops(db: &mut MutableAnyTest, ops: Vec<Operation<Digest, Vec<u8>>>) {
+    pub(crate) async fn apply_ops(db: &mut AnyTest, ops: Vec<Operation<Digest, Vec<u8>>>) {
         for op in ops {
             match op {
                 Operation::Update(data) => {
@@ -323,7 +320,7 @@ pub(crate) mod test {
     fn test_ordered_any_update_batch_create_between_collisions() {
         let executor = deterministic::Runner::default();
         executor.start(|context| async move {
-            let mut db = open_variable_db(context.clone()).await.into_mutable();
+            let mut db = open_variable_db(context.clone()).await;
 
             // This DB uses a TwoCap so we use equivalent two byte prefixes for each key to ensure
             // collisions.
@@ -334,18 +331,17 @@ pub(crate) mod test {
 
             db.write_batch([(key1.clone(), Some(val))]).await.unwrap();
             db.write_batch([(key3.clone(), Some(val))]).await.unwrap();
-            let (db, _) = db.commit(None).await.unwrap();
+            db.commit(None).await.unwrap();
 
             assert_eq!(db.get(&key1).await.unwrap().unwrap(), val);
             assert!(db.get(&key2).await.unwrap().is_none());
             assert_eq!(db.get(&key3).await.unwrap().unwrap(), val);
 
             // Batch-insert the middle key.
-            let mut db = db.into_mutable();
             let mut batch = db.start_batch();
             batch.update(key2.clone(), val).await.unwrap();
             db.write_batch(batch.into_iter()).await.unwrap();
-            let (db, _) = db.commit(None).await.unwrap();
+            db.commit(None).await.unwrap();
 
             assert_eq!(db.get(&key1).await.unwrap().unwrap(), val);
             assert_eq!(db.get(&key2).await.unwrap().unwrap(), val);
@@ -358,7 +354,7 @@ pub(crate) mod test {
             let span3 = db.get_span(&key3).await.unwrap().unwrap();
             assert_eq!(span3.1.next_key, key1);
 
-            let db = db.into_mutable().commit(None).await.unwrap().0;
+            db.commit(None).await.unwrap();
             db.destroy().await.unwrap();
         });
     }
@@ -377,12 +373,10 @@ pub(crate) mod test {
             let val3 = Sha256::fill(3u8);
 
             // Delete the previous key of a newly created key.
-            let mut db = open_variable_db(context.with_label("first"))
-                .await
-                .into_mutable();
+            let mut db = open_variable_db(context.with_label("first")).await;
             db.write_batch([(key1.clone(), Some(val1))]).await.unwrap();
             db.write_batch([(key3.clone(), Some(val3))]).await.unwrap();
-            let mut db = db.commit(None).await.unwrap().0.into_mutable();
+            db.commit(None).await.unwrap();
 
             let mut batch = db.start_batch();
             batch.delete(key1.clone()).await.unwrap();
@@ -396,16 +390,14 @@ pub(crate) mod test {
             assert_eq!(span2.1.next_key, key3);
             let span3 = db.get_span(&key3).await.unwrap().unwrap();
             assert_eq!(span3.1.next_key, key2);
-            let db = db.commit(None).await.unwrap().0;
+            db.commit(None).await.unwrap();
             db.destroy().await.unwrap();
 
             // Create a key that becomes the previous key of a concurrently deleted key.
-            let mut db = open_variable_db(context.with_label("second"))
-                .await
-                .into_mutable();
+            let mut db = open_variable_db(context.with_label("second")).await;
             db.write_batch([(key1.clone(), Some(val1))]).await.unwrap();
             db.write_batch([(key3.clone(), Some(val3))]).await.unwrap();
-            let mut db = db.commit(None).await.unwrap().0.into_mutable();
+            db.commit(None).await.unwrap();
 
             let mut batch = db.start_batch();
             batch.create(key2.clone(), val2).await.unwrap();
@@ -419,35 +411,399 @@ pub(crate) mod test {
             assert_eq!(span1.1.next_key, key2);
             let span2 = db.get_span(&key2).await.unwrap().unwrap();
             assert_eq!(span2.1.next_key, key1);
-            let db = db.commit(None).await.unwrap().0;
+            db.commit(None).await.unwrap();
             db.destroy().await.unwrap();
         });
     }
 
     #[allow(dead_code)]
-    fn assert_merkleized_db_futures_are_send(db: &mut AnyTest, key: Digest, loc: Location) {
+    fn assert_db_futures_are_send(db: &mut AnyTest, key: Digest, value: Vec<u8>, loc: Location) {
         assert_gettable(db, &key);
         assert_log_store(db);
         assert_prunable_store(db, loc);
         assert_merkleized_store(db, loc);
         assert_send(db.sync());
-    }
-
-    #[allow(dead_code)]
-    fn assert_mutable_db_futures_are_send(db: &mut MutableAnyTest, key: Digest, value: Vec<u8>) {
-        assert_gettable(db, &key);
-        assert_log_store(db);
         assert_send(db.write_batch([(key, Some(value.clone()))]));
         assert_send(db.write_batch([(key, None)]));
         assert_batchable(db, key, value);
         assert_send(db.get_all(&key));
         assert_send(db.get_with_loc(&key));
         assert_send(db.get_span(&key));
+        assert_send(db.commit(None));
     }
 
-    #[allow(dead_code)]
-    fn assert_mutable_db_commit_is_send(db: MutableAnyTest) {
-        assert_send(db.commit(None));
+    // ============================================================
+    // Batch API comparison tests (Step 2)
+    // ============================================================
+
+    /// Helper: apply operations via the old path (write_batch + commit).
+    async fn apply_old_path(
+        db: &mut AnyTest,
+        ops: &[(Digest, Option<Vec<u8>>)],
+        metadata: Option<Vec<u8>>,
+    ) {
+        db.write_batch(ops.iter().map(|(k, v)| (*k, v.clone())))
+            .await
+            .unwrap();
+        db.commit(metadata).await.unwrap();
+    }
+
+    /// Helper: apply operations via the new batch path.
+    async fn apply_new_path(
+        db: &mut AnyTest,
+        ops: &[(Digest, Option<Vec<u8>>)],
+        metadata: Option<Vec<u8>>,
+    ) {
+        let mut batch = db.new_batch();
+        for (key, value) in ops {
+            batch.write(*key, value.clone());
+        }
+        let merkleized = batch.merkleize(metadata).await.unwrap();
+        let finalized = merkleized.finalize();
+        db.apply_batch(finalized).await.unwrap();
+    }
+
+    /// Compare two DBs state: root, inactivity floor, active keys.
+    fn assert_db_state_eq(old: &AnyTest, new: &AnyTest) {
+        assert_eq!(old.root(), new.root(), "root mismatch");
+        assert_eq!(
+            old.inactivity_floor_loc(),
+            new.inactivity_floor_loc(),
+            "inactivity floor mismatch"
+        );
+        assert_eq!(old.active_keys, new.active_keys, "active_keys mismatch");
+        assert_eq!(
+            old.last_commit_loc, new.last_commit_loc,
+            "last_commit_loc mismatch"
+        );
+    }
+
+    /// Test: single update produces identical state via old and new paths.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_single_update() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut old_db = create_test_db(context.with_label("old")).await;
+            let mut new_db = create_test_db(context.with_label("new")).await;
+
+            let key = Sha256::hash(&0u64.to_be_bytes());
+            let value = vec![1, 2, 3, 4, 5];
+            let ops = vec![(key, Some(value))];
+
+            apply_old_path(&mut old_db, &ops, None).await;
+            apply_new_path(&mut new_db, &ops, None).await;
+
+            assert_db_state_eq(&old_db, &new_db);
+
+            let old_val = old_db.get(&key).await.unwrap();
+            let new_val = new_db.get(&key).await.unwrap();
+            assert_eq!(old_val, new_val);
+
+            old_db.destroy().await.unwrap();
+            new_db.destroy().await.unwrap();
+        });
+    }
+
+    /// Test: multiple updates in one batch produce identical state.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_multiple_updates() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut old_db = create_test_db(context.with_label("old")).await;
+            let mut new_db = create_test_db(context.with_label("new")).await;
+
+            let ops: Vec<_> = (0u64..50)
+                .map(|i| {
+                    let key = Sha256::hash(&i.to_be_bytes());
+                    let value = vec![(i % 255) as u8; ((i % 13) + 7) as usize];
+                    (key, Some(value))
+                })
+                .collect();
+
+            apply_old_path(&mut old_db, &ops, None).await;
+            apply_new_path(&mut new_db, &ops, None).await;
+
+            assert_db_state_eq(&old_db, &new_db);
+
+            for (key, expected) in &ops {
+                let old_val = old_db.get(key).await.unwrap();
+                let new_val = new_db.get(key).await.unwrap();
+                assert_eq!(old_val, new_val);
+                assert_eq!(old_val.as_ref(), expected.as_ref());
+            }
+
+            old_db.destroy().await.unwrap();
+            new_db.destroy().await.unwrap();
+        });
+    }
+
+    /// Test: updates then deletes, all in one batch.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_updates_and_deletes() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut old_db = create_test_db(context.with_label("old")).await;
+            let mut new_db = create_test_db(context.with_label("new")).await;
+
+            // First commit: create some keys.
+            let create_ops: Vec<_> = (0u64..20)
+                .map(|i| {
+                    let key = Sha256::hash(&i.to_be_bytes());
+                    let value = vec![(i % 255) as u8; 10];
+                    (key, Some(value))
+                })
+                .collect();
+
+            apply_old_path(&mut old_db, &create_ops, None).await;
+            apply_new_path(&mut new_db, &create_ops, None).await;
+            assert_db_state_eq(&old_db, &new_db);
+
+            // Second commit: update some, delete some.
+            let mut mixed_ops = Vec::new();
+            for i in 0u64..20 {
+                let key = Sha256::hash(&i.to_be_bytes());
+                if i % 3 == 0 {
+                    mixed_ops.push((key, None));
+                } else {
+                    mixed_ops.push((key, Some(vec![((i + 1) % 255) as u8; 15])));
+                }
+            }
+
+            apply_old_path(&mut old_db, &mixed_ops, None).await;
+            apply_new_path(&mut new_db, &mixed_ops, None).await;
+
+            assert_db_state_eq(&old_db, &new_db);
+
+            for i in 0u64..20 {
+                let key = Sha256::hash(&i.to_be_bytes());
+                let old_val = old_db.get(&key).await.unwrap();
+                let new_val = new_db.get(&key).await.unwrap();
+                assert_eq!(old_val, new_val, "mismatch at key {i}");
+            }
+
+            old_db.destroy().await.unwrap();
+            new_db.destroy().await.unwrap();
+        });
+    }
+
+    /// Test: multiple sequential commits produce identical state.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_multiple_commits() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut old_db = create_test_db(context.with_label("old")).await;
+            let mut new_db = create_test_db(context.with_label("new")).await;
+
+            for round in 0u64..5 {
+                let ops: Vec<_> = (0u64..20)
+                    .map(|i| {
+                        let key = Sha256::hash(&(round * 100 + i).to_be_bytes());
+                        let value = vec![(i % 255) as u8; ((i % 13) + 7) as usize];
+                        (key, Some(value))
+                    })
+                    .collect();
+
+                apply_old_path(&mut old_db, &ops, None).await;
+                apply_new_path(&mut new_db, &ops, None).await;
+
+                assert_db_state_eq(&old_db, &new_db);
+            }
+
+            old_db.destroy().await.unwrap();
+            new_db.destroy().await.unwrap();
+        });
+    }
+
+    /// Test: metadata is correctly stored.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_with_metadata() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut old_db = create_test_db(context.with_label("old")).await;
+            let mut new_db = create_test_db(context.with_label("new")).await;
+
+            let key = Sha256::hash(&0u64.to_be_bytes());
+            let value = vec![42u8; 10];
+            let metadata = vec![99u8; 5];
+            let ops = vec![(key, Some(value))];
+
+            apply_old_path(&mut old_db, &ops, Some(metadata.clone())).await;
+            apply_new_path(&mut new_db, &ops, Some(metadata.clone())).await;
+
+            assert_db_state_eq(&old_db, &new_db);
+
+            let old_meta = old_db.get_metadata().await.unwrap();
+            let new_meta = new_db.get_metadata().await.unwrap();
+            assert_eq!(old_meta, new_meta);
+            assert_eq!(old_meta, Some(metadata));
+
+            old_db.destroy().await.unwrap();
+            new_db.destroy().await.unwrap();
+        });
+    }
+
+    /// Test: speculative root matches committed root.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_speculative_root() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut db = create_test_db(context).await;
+
+            let ops: Vec<_> = (0u64..30)
+                .map(|i| {
+                    let key = Sha256::hash(&i.to_be_bytes());
+                    let value = vec![(i % 255) as u8; 10];
+                    (key, Some(value))
+                })
+                .collect();
+
+            let mut batch = db.new_batch();
+            for (key, value) in &ops {
+                batch.write(*key, value.clone());
+            }
+            let merkleized = batch.merkleize(None).await.unwrap();
+            let speculative_root = merkleized.root();
+            let finalized = merkleized.finalize();
+            db.apply_batch(finalized).await.unwrap();
+
+            assert_eq!(
+                speculative_root,
+                db.root(),
+                "speculative root should match committed root"
+            );
+
+            db.destroy().await.unwrap();
+        });
+    }
+
+    /// Test: Batch::get reads through mutations and falls back to db.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_get_read_through() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut db = create_test_db(context).await;
+
+            let key1 = Sha256::hash(&1u64.to_be_bytes());
+            let key2 = Sha256::hash(&2u64.to_be_bytes());
+            let key3 = Sha256::hash(&3u64.to_be_bytes());
+            apply_new_path(&mut db, &[(key1, Some(vec![1]))], None).await;
+
+            let mut batch = db.new_batch();
+            batch.write(key2, Some(vec![2]));
+            batch.write(key1, None);
+
+            assert_eq!(batch.get(&key2).await.unwrap(), Some(vec![2]));
+            assert_eq!(batch.get(&key1).await.unwrap(), None);
+            assert_eq!(batch.get(&key3).await.unwrap(), None);
+
+            db.destroy().await.unwrap();
+        });
+    }
+
+    /// Large mixed workload: creates, updates, deletes across multiple commits.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_large_mixed_workload() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut old_db = create_test_db(context.with_label("old")).await;
+            let mut new_db = create_test_db(context.with_label("new")).await;
+
+            // Commit 1: Create 100 keys.
+            let ops: Vec<_> = (0u64..100)
+                .map(|i| {
+                    let key = Sha256::hash(&i.to_be_bytes());
+                    let value = vec![(i % 255) as u8; ((i % 13) + 7) as usize];
+                    (key, Some(value))
+                })
+                .collect();
+            apply_old_path(&mut old_db, &ops, None).await;
+            apply_new_path(&mut new_db, &ops, None).await;
+            assert_db_state_eq(&old_db, &new_db);
+
+            // Commit 2: Update every 3rd key, delete every 7th.
+            let mut ops2 = Vec::new();
+            for i in 0u64..100 {
+                let key = Sha256::hash(&i.to_be_bytes());
+                if i % 7 == 1 {
+                    ops2.push((key, None));
+                } else if i % 3 == 0 {
+                    ops2.push((
+                        key,
+                        Some(vec![((i + 1) % 255) as u8; ((i % 13) + 8) as usize]),
+                    ));
+                }
+            }
+            apply_old_path(&mut old_db, &ops2, None).await;
+            apply_new_path(&mut new_db, &ops2, None).await;
+            assert_db_state_eq(&old_db, &new_db);
+
+            // Commit 3: Add 50 new keys + update some existing.
+            let mut ops3 = Vec::new();
+            for i in 100u64..150 {
+                let key = Sha256::hash(&i.to_be_bytes());
+                ops3.push((key, Some(vec![(i % 255) as u8; 10])));
+            }
+            for i in 0u64..20 {
+                let key = Sha256::hash(&i.to_be_bytes());
+                ops3.push((key, Some(vec![42u8; 10])));
+            }
+            apply_old_path(&mut old_db, &ops3, Some(vec![0xAB])).await;
+            apply_new_path(&mut new_db, &ops3, Some(vec![0xAB])).await;
+            assert_db_state_eq(&old_db, &new_db);
+
+            for i in 0u64..150 {
+                let key = Sha256::hash(&i.to_be_bytes());
+                let old_val = old_db.get(&key).await.unwrap();
+                let new_val = new_db.get(&key).await.unwrap();
+                assert_eq!(old_val, new_val, "mismatch at key {i}");
+            }
+
+            let old_meta = old_db.get_metadata().await.unwrap();
+            let new_meta = new_db.get_metadata().await.unwrap();
+            assert_eq!(old_meta, new_meta);
+
+            old_db.destroy().await.unwrap();
+            new_db.destroy().await.unwrap();
+        });
+    }
+
+    /// Test: empty batch (no mutations) still produces a valid CommitFloor.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_empty() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut old_db = create_test_db(context.with_label("old")).await;
+            let mut new_db = create_test_db(context.with_label("new")).await;
+
+            apply_old_path(&mut old_db, &[], None).await;
+            apply_new_path(&mut new_db, &[], None).await;
+
+            assert_db_state_eq(&old_db, &new_db);
+
+            old_db.destroy().await.unwrap();
+            new_db.destroy().await.unwrap();
+        });
+    }
+
+    /// Test: delete a key that doesn't exist is a no-op.
+    #[test_traced("WARN")]
+    fn test_batch_ordered_delete_nonexistent() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut old_db = create_test_db(context.with_label("old")).await;
+            let mut new_db = create_test_db(context.with_label("new")).await;
+
+            let nonexistent_key = Sha256::hash(&999u64.to_be_bytes());
+            let ops = vec![(nonexistent_key, None)];
+
+            apply_old_path(&mut old_db, &ops, None).await;
+            apply_new_path(&mut new_db, &ops, None).await;
+
+            assert_db_state_eq(&old_db, &new_db);
+
+            old_db.destroy().await.unwrap();
+            new_db.destroy().await.unwrap();
+        });
     }
 
     // FromSyncTestable implementation for from_sync_result tests
