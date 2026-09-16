@@ -134,6 +134,20 @@ pub trait Blocks: Send + Sync + Sized + 'static {
     /// * `block`: The finalized block, which provides its `height()` and `digest()`.
     fn put(self, block: Self::Block) -> impl Future<Output = Result<Self, Self::Error>> + Send;
 
+    /// Buffer a block and optionally confirm that this call newly stored it.
+    ///
+    /// `true` guarantees the exact supplied block is now readable at its height,
+    /// excluding ignored overwrites, pruned no-ops, and insertion followed by
+    /// eviction. It does not imply durability. A store unable to prove this must
+    /// return `false`; the default preserves `put` behavior without confirmation.
+    /// Callers may use confirmation to reuse an already validated decoded block.
+    fn put_confirmed(
+        self,
+        block: Self::Block,
+    ) -> impl Future<Output = Result<(Self, bool), Self::Error>> + Send {
+        async move { self.put(block).await.map(|store| (store, false)) }
+    }
+
     /// Flush all buffered writes to durable storage.
     fn sync(self) -> impl Future<Output = Result<Self, Self::Error>> + Send;
 
@@ -397,6 +411,16 @@ where
 
     async fn put(self, block: Self::Block) -> Result<Self, Self::Error> {
         Archive::put(self, block.height().get(), block.digest(), block).await
+    }
+
+    async fn put_confirmed(self, block: Self::Block) -> Result<(Self, bool), Self::Error> {
+        let height = block.height().get();
+        let existed = Archive::has(&self, Identifier::Index(height)).await?;
+        let store = Blocks::put(self, block).await?;
+        // This archive is exclusively owned across the write. A newly present
+        // height therefore contains this exact input, not a conflicting overwrite.
+        let confirmed = !existed && Archive::has(&store, Identifier::Index(height)).await?;
+        Ok((store, confirmed))
     }
 
     async fn sync(self) -> Result<Self, Self::Error> {
