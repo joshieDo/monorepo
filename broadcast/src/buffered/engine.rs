@@ -365,7 +365,10 @@ where
             .and_modify(|c| *c = c.checked_add(1).unwrap())
             .or_insert(1);
         if *count == 1 {
-            let existing = self.items.insert(digest, make_shared());
+            let shared = tracing::debug_span!(target: "lifecycle", "broadcast.cache.acquire")
+                .in_scope(make_shared);
+            let existing = tracing::debug_span!(target: "lifecycle", "broadcast.cache.insert")
+                .in_scope(|| self.items.insert(digest, shared));
             assert!(existing.is_none());
         }
 
@@ -449,6 +452,7 @@ where
 }
 
 /// Decrement a digest refcount and evict it from cache when no references remain.
+#[tracing::instrument(name = "broadcast.cache.evict", target = "lifecycle", level = "debug", skip_all)]
 fn decrement_digest_refcount<D: Ord, M>(
     counts: &mut BTreeMap<D, usize>,
     items: &mut BTreeMap<D, M>,
@@ -462,6 +466,93 @@ fn decrement_digest_refcount<D: Ord, M>(
     if should_remove {
         let existing = counts.remove(digest);
         assert!(existing == Some(0));
-        items.remove(digest);
+        let removed = tracing::debug_span!(target: "lifecycle", "broadcast.cache.remove")
+            .in_scope(|| items.remove(digest));
+        // Dropping a cache reference may release the value, or only decrement an
+        // Arc when another owner still holds it. Keep this on the same thread,
+        // before returning, and separate it from the map mutation.
+        tracing::debug_span!(target: "lifecycle", "broadcast.cache.drop")
+            .in_scope(|| drop(removed));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_utils::sync::Mutex;
+    use tracing::{Subscriber, span::Id};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
+
+    type Events = Arc<Mutex<Vec<(&'static str, &'static str)>>>;
+
+    struct Capture(Events);
+
+    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
+        fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
+            self.0.lock().push(("enter", ctx.span(id).unwrap().name()));
+        }
+
+        fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
+            self.0.lock().push(("exit", ctx.span(id).unwrap().name()));
+        }
+    }
+
+    struct DropProbe(Events);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let current = tracing::Span::current();
+            let scope = current.metadata().map_or("outside", |meta| meta.name());
+            self.0.lock().push(("destroy", scope));
+        }
+    }
+
+    #[test]
+    fn eviction_drop_is_separate_from_map_removal() {
+        let events = Events::default();
+        let subscriber = tracing_subscriber::registry().with(Capture(events.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut counts = BTreeMap::from([(1, 1)]);
+            let mut items = BTreeMap::from([(1, Arc::new(DropProbe(events.clone())))]);
+            decrement_digest_refcount(&mut counts, &mut items, &1);
+            assert!(counts.is_empty());
+            assert!(items.is_empty());
+        });
+        assert_eq!(
+            *events.lock(),
+            [
+                ("enter", "broadcast.cache.evict"),
+                ("enter", "broadcast.cache.remove"),
+                ("exit", "broadcast.cache.remove"),
+                ("enter", "broadcast.cache.drop"),
+                ("destroy", "broadcast.cache.drop"),
+                ("exit", "broadcast.cache.drop"),
+                ("exit", "broadcast.cache.evict"),
+            ]
+        );
+    }
+
+    #[test]
+    fn eviction_preserves_peer_references_and_external_owners() {
+        let events = Events::default();
+        let subscriber = tracing_subscriber::registry().with(Capture(events.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let external = Arc::new(DropProbe(events.clone()));
+            let mut counts = BTreeMap::from([(1, 2)]);
+            let mut items = BTreeMap::from([(1, external.clone())]);
+            decrement_digest_refcount(&mut counts, &mut items, &1);
+            assert_eq!(counts[&1], 1);
+            assert!(Arc::ptr_eq(&items[&1], &external));
+            assert_eq!(
+                *events.lock(),
+                [("enter", "broadcast.cache.evict"), ("exit", "broadcast.cache.evict")]
+            );
+            decrement_digest_refcount(&mut counts, &mut items, &1);
+            assert!(counts.is_empty());
+            assert!(items.is_empty());
+            assert!(!events.lock().iter().any(|(kind, _)| *kind == "destroy"));
+            drop(external);
+            assert_eq!(events.lock().last(), Some(&("destroy", "outside")));
+        });
     }
 }
