@@ -2,6 +2,7 @@ use super::{
     Buffer, Retirement, Variant,
     acks::{PendingAck, PendingAcks},
     cache,
+    decoded::DecodedBlocks,
     delivery::PendingVerification,
     durability::{DispatchGate, Durable as _},
     floor::{Floor, State as FloorState},
@@ -25,7 +26,7 @@ use crate::{
 };
 use bytes::Bytes;
 use commonware_actor::mailbox;
-use commonware_codec::{Decode, Encode, Read};
+use commonware_codec::{Decode, Encode, EncodeSize, Read};
 use commonware_cryptography::{
     Digestible,
     certificate::{Provider, Scoped, Verifier},
@@ -47,6 +48,7 @@ use commonware_utils::{
     acknowledgement::Exact,
     channel::{fallible::OneshotExt, oneshot},
     futures::{AbortablePool, Pool},
+    sync::Mutex,
 };
 use futures::{
     FutureExt as _, TryFutureExt as _,
@@ -54,12 +56,22 @@ use futures::{
     try_join,
 };
 use rand_core::CryptoRng;
-use std::{collections::BTreeMap, future::Future, num::NonZeroUsize, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    num::NonZeroUsize,
+    sync::Arc,
+};
 use tracing::{Instrument as _, Span, debug, info_span, warn};
 
 // Resolver request keys are expressed in the variant commitment type, which
 // may differ from the block digest for coded variants.
 type ResolverRequestFor<V> = Key<<V as Variant>::Commitment>;
+type DecodedFor<V> = DecodedBlocks<
+    <V as Variant>::Commitment,
+    <<V as Variant>::Block as Digestible>::Digest,
+    <V as Variant>::Block,
+>;
 
 // A resolver delivery plus the peer-validity response channel. Local
 // annotations on the delivery decide how accepted data is used.
@@ -147,6 +159,8 @@ where
     // ---------- Storage ----------
     // Prunable cache
     cache: cache::Manager<E, V, P::Scheme>,
+    // Bounded reuse of decoded archive reads; never a durability signal.
+    decoded_blocks: Mutex<DecodedFor<V>>,
     // Finalizations stored by height
     finalizations_by_height: FC,
     // Finalized blocks stored by height
@@ -265,6 +279,7 @@ where
                 block_subscriptions: Subscriptions::new(),
                 dispatch_gate: DispatchGate::default(),
                 cache,
+                decoded_blocks: Mutex::new(DecodedBlocks::new(16, 64 * 1024 * 1024)),
                 finalizations_by_height,
                 finalized_blocks,
                 finalized_height,
@@ -2015,12 +2030,20 @@ where
 
     /// Get a finalized block from the immutable archive.
     async fn get_finalized_block(&self, height: Height) -> Option<V::Block> {
+        if let Some(block) = self.decoded_blocks.lock().by_height(height) {
+            return Some(Arc::unwrap_or_clone(block));
+        }
         match self
             .finalized_blocks
             .get(ArchiveID::Index(height.get()))
             .await
         {
-            Ok(stored) => stored.map(|stored| stored.into()),
+            Ok(Some(stored)) => {
+                let block = Arc::new(stored.into());
+                self.remember_decoded(Arc::clone(&block), true);
+                Some(Arc::unwrap_or_clone(block))
+            }
+            Ok(None) => None,
             Err(e) => panic!("failed to get block: {e}"),
         }
     }
@@ -2220,7 +2243,12 @@ where
         if let Some(block) = buffer.find_by_digest(digest).await {
             return Some(block);
         }
-        self.find_block_in_storage(digest).await.map(Arc::new)
+        if let Some(block) = self.decoded_blocks.lock().by_digest(&digest) {
+            return Some(block);
+        }
+        let block = Arc::new(self.find_block_in_storage(digest).await?);
+        self.remember_decoded(Arc::clone(&block), false);
+        Some(block)
     }
 
     /// Looks for a block anywhere in local storage using the full commitment.
@@ -2236,9 +2264,28 @@ where
         if let Some(block) = buffer.find_by_commitment(commitment).await {
             return Some(block);
         }
-        self.find_block_in_storage_by_commitment(commitment)
-            .await
-            .map(Arc::new)
+        if let Some(block) = self
+            .decoded_blocks
+            .lock()
+            .by_commitment(&commitment)
+        {
+            return Some(block);
+        }
+        let block = Arc::new(self.find_block_in_storage_by_commitment(commitment).await?);
+        self.remember_decoded(Arc::clone(&block), false);
+        Some(block)
+    }
+
+    /// Retain only successfully decoded archive reads. Cache presence says nothing
+    /// about application validity, certificates, or durability.
+    fn remember_decoded(&self, block: Arc<V::Block>, finalized: bool) {
+        let commitment = V::commitment(&block);
+        let digest = block.digest();
+        let bytes = block.encode_size();
+        let height = block.height();
+        self.decoded_blocks
+            .lock()
+            .insert(commitment, digest, block, bytes, height, finalized);
     }
 
     /// Attempt to repair any identified gaps in the finalized blocks archive. The total
@@ -2505,6 +2552,7 @@ where
             processed_round.view().saturating_sub(self.view_retention),
         );
         self.cache = self.cache.prune_by_view(prune_round).await;
+        self.decoded_blocks.lock().prune(None);
 
         // Resolver request retention is independent of caller-owned block subscriptions.
         resolver.retain(handler::above_round_floor::<V::Commitment>(round));
@@ -2539,6 +2587,7 @@ where
                 .map_err(BoxedError::from),
         )
         .unwrap_or_else(|e| panic!("failed to prune finalized archives: {e}"));
+        self.decoded_blocks.lock().prune(Some(height));
         self
     }
 
@@ -2558,6 +2607,7 @@ where
                 .map_err(BoxedError::from),
         )
         .unwrap_or_else(|e| panic!("failed to prune data below floor: {e}"));
+        self.decoded_blocks.lock().prune(Some(height));
         self
     }
 }
