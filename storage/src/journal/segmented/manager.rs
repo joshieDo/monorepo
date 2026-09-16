@@ -315,6 +315,7 @@ impl<E: Storage + Metrics, F: BufferFactory<E::Blob>> Manager<E, F> {
     /// the started sync resurfaces from the buffer on the section's next operation. A failure to
     /// flush buffered data while starting the sync, however, is reported only through the
     /// returned handle, so callers must observe the handle to detect it.
+    #[tracing::instrument(target = "lifecycle", name = "storage.journal.start_sections_sync", level = "debug", skip_all)]
     pub async fn start_sync(
         &mut self,
         sections: impl crate::Sections,

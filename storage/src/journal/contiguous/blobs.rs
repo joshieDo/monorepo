@@ -432,11 +432,12 @@ impl<E: Context> Writable<E> {
 
     /// Start syncing the tail, returning a handle that completes once both the tail and its
     /// predecessor are durable.
+    #[tracing::instrument(target = "lifecycle", name = "storage.journal.start_tail_sync", level = "debug", skip_all)]
     pub(super) async fn start_sync(&mut self) -> Handle<()> {
         // Keep at most one tail sync in flight. A pending predecessor sync is not awaited here:
         // the returned handle joins it, so handles from consecutive calls can be pending at once.
         if let Some(prior) = self.tail_sync.clone()
-            && let Err(err) = prior.await
+            && let Err(err) = tracing::Instrument::instrument(prior, tracing::debug_span!(target: "lifecycle", "storage.journal.wait_prior_sync")).await
         {
             return Handle::ready(Err(err));
         }

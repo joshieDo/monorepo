@@ -413,7 +413,14 @@ impl crate::Blob for Blob {
         let file = self.file.clone();
         let partition = self.partition.clone();
         let name = self.name.clone();
-        task::spawn_blocking(move || Self::sync_inner(&file, &partition, &name))
+        let request = tracing::debug_span!(target: "lifecycle", "storage.blob.sync_request");
+        let queue = tracing::debug_span!(target: "lifecycle", parent: &request, "storage.blob.blocking_queue");
+        task::spawn_blocking(move || {
+            drop(queue);
+            let _request = request.enter();
+            tracing::debug_span!(target: "lifecycle", "storage.blob.fsync")
+                .in_scope(|| Self::sync_inner(&file, &partition, &name))
+        })
             .await
             .map_err(|e| {
                 let err: std::io::Error = e.into();
@@ -426,8 +433,13 @@ impl crate::Blob for Blob {
         let file = self.file.clone();
         let partition = self.partition.clone();
         let name = self.name.clone();
+        let request = tracing::debug_span!(target: "lifecycle", "storage.blob.sync_request");
+        let queue = tracing::debug_span!(target: "lifecycle", parent: &request, "storage.blob.blocking_queue");
         task::spawn_blocking(move || {
-            let result = Self::sync_inner(&file, &partition, &name);
+            drop(queue);
+            let _request = request.enter();
+            let result = tracing::debug_span!(target: "lifecycle", "storage.blob.fsync")
+                .in_scope(|| Self::sync_inner(&file, &partition, &name));
             let _ = tx.send(result);
         });
         Handle::from_receiver(rx)

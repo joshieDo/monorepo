@@ -73,6 +73,7 @@ impl SyncState {
     }
 
     /// Wait for an in-flight sync before reusing or mutating the blob.
+    #[tracing::instrument(target = "lifecycle", name = "storage.buffer.wait_pending_sync", level = "debug", skip_all)]
     async fn wait_for_pending(&mut self) -> Result<(), crate::Error> {
         let Self::Pending(pending) = self else {
             return Ok(());
@@ -91,6 +92,7 @@ impl SyncState {
     }
 
     /// Write data with the provided options while tracking durability.
+    #[tracing::instrument(target = "lifecycle", name = "storage.buffer.write", level = "debug", skip_all)]
     async fn write_at(
         &mut self,
         blob: &impl crate::Blob,

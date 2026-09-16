@@ -243,6 +243,7 @@ impl<B: Blob> Write<B> {
     /// Awaiting the returned [`Handle`] waits for the same durability guarantee as [`Self::sync`]
     /// for the state flushed by this call. Later calls to [`Self::sync`] and writer methods that
     /// mutate the blob wait before issuing blob operations.
+    #[tracing::instrument(target = "lifecycle", name = "storage.buffer.start_sync", level = "debug", skip_all)]
     pub async fn start_sync(&mut self) -> Handle<()> {
         if let Some((buf, offset)) = self.buffer.take()
             && let Err(err) = self

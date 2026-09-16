@@ -406,6 +406,7 @@ impl crate::Blob for Blob {
         })
     }
 
+    #[tracing::instrument(target = "lifecycle", name = "storage.blob.iouring.sync", level = "debug", skip_all)]
     async fn sync(&self) -> Result<(), Error> {
         self.io_handle
             .sync(self.file.clone())
@@ -416,18 +417,20 @@ impl crate::Blob for Blob {
             })
     }
 
+    #[tracing::instrument(target = "lifecycle", name = "storage.blob.iouring.start_sync", level = "debug", skip_all)]
     async fn start_sync(&self) -> Handle<()> {
         let partition = self.partition.clone();
         let name = self.name.clone();
+        let request = tracing::debug_span!(target: "lifecycle", "storage.blob.iouring.sync_request");
         let receiver = self.io_handle.start_sync(self.file.clone()).await;
-        Handle::from_future(async move {
+        Handle::from_future(tracing::Instrument::instrument(async move {
             match receiver.await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(Error::Io(e))) => Err(Error::BlobSyncFailed(partition, hex(&name), e)),
                 Ok(Err(err)) => Err(err),
                 Err(_) => Err(Error::Closed),
             }
-        })
+        }, request))
     }
 }
 

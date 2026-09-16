@@ -503,6 +503,7 @@ where
                 debug!("mailbox closed, shutting down");
                 break;
             } => {
+                tracing::info!(target: "lifecycle", parent: message.span(), stage = "marshal_dequeued");
                 let span = info_span!(
                     parent: message.span(),
                     "marshal.actor.process",
@@ -1974,9 +1975,10 @@ where
             (self.finalized_blocks, blocks),
             (self.finalizations_by_height, finalizations),
         ) = try_join!(
-            self.finalized_blocks.start_sync().map_err(BoxedError::from),
+            self.finalized_blocks.start_sync().instrument(info_span!(target: "lifecycle", "marshal.finalized_blocks.start_sync")).map_err(BoxedError::from),
             self.finalizations_by_height
                 .start_sync()
+                .instrument(info_span!(target: "lifecycle", "marshal.finalizations.start_sync"))
                 .map_err(BoxedError::from),
         )
         .unwrap_or_else(|e| panic!("failed to start finalization archive sync: {e}"));

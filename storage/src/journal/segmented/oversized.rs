@@ -813,6 +813,7 @@ impl<E: Context, I: Record + Send + Sync, V: CodecShared> Oversized<E, I, V> {
     /// The returned handle covers only the requested data syncs. Marker generations trail
     /// data durability by design, and a marker failure surfaces as [Error::Metadata] when a
     /// later request observes it.
+    #[tracing::instrument(target = "lifecycle", name = "storage.journal.start_tracked_sync", level = "debug", skip_all)]
     pub(crate) async fn start_sync_tracked(
         mut self,
         sections: &BTreeSet<u64>,
