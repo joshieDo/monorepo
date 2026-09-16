@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Mutex;
+use tracing::Instrument as _;
 
 mod blob;
 
@@ -67,9 +68,16 @@ impl Storage {
         &self,
         f: impl FnOnce() -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let guard = self.lock.clone().lock_owned().await;
+        let guard = self.lock.clone().lock_owned().instrument(
+            tracing::debug_span!(target: "lifecycle", "storage.metadata.lock_wait")
+        ).await;
         let hold = self.hold.clone();
+        let request = tracing::debug_span!(target: "lifecycle", "storage.metadata.request");
+        let queue = tracing::debug_span!(target: "lifecycle", parent: &request, "storage.metadata.blocking_queue");
         let task = tokio::task::spawn_blocking(move || {
+            drop(queue);
+            let _request = request.enter();
+            let _operation = tracing::debug_span!(target: "lifecycle", "storage.metadata.execute").entered();
             let _hold = hold;
             let _guard = guard;
             f()
@@ -85,6 +93,7 @@ impl Storage {
 impl crate::Storage for Storage {
     type Blob = blob::Blob;
 
+    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.open", level = "debug", skip_all)]
     async fn open_versioned(
         &self,
         partition: &str,
@@ -145,8 +154,10 @@ impl crate::Storage for Storage {
                     // parses a header never re-runs these). The storage directory is
                     // synced unconditionally: the partition directory existing in the
                     // namespace does not imply its entry is durable.
-                    sync_dir(parent)?;
-                    sync_dir(&storage_directory)?;
+                    tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_partition")
+                        .in_scope(|| sync_dir(parent))?;
+                    tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_root")
+                        .in_scope(|| sync_dir(&storage_directory))?;
 
                     // Truncate to zero before writing, per the [Header::create] contract.
                     let (region, blob_version) = Header::create(&blob_layouts, &versions);
@@ -157,7 +168,8 @@ impl crate::Storage for Storage {
                     file.seek(SeekFrom::Start(0))
                         .map_err(|_| Error::WriteFailed)?;
                     file.write_all(&region).map_err(|_| Error::WriteFailed)?;
-                    file.sync_all().map_err(|e| {
+                    tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_header")
+                        .in_scope(|| file.sync_all()).map_err(|e| {
                         Error::BlobSyncFailed(partition.clone(), hex(&name), e.into())
                     })?;
                     (0, blob_version, data_offset)
@@ -171,6 +183,7 @@ impl crate::Storage for Storage {
         .await
     }
 
+    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.remove", level = "debug", skip_all)]
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
         super::validate_partition_name(partition)?;
 
@@ -202,6 +215,7 @@ impl crate::Storage for Storage {
         .await
     }
 
+    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.scan", level = "debug", skip_all)]
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         super::validate_partition_name(partition)?;
 
