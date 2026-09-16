@@ -3,6 +3,7 @@ use crate::{BlobVersion, BufferPool, Error};
 use commonware_formatting::{from_hex, hex};
 use std::{
     fs,
+    hash::{DefaultHasher, Hasher},
     io::{Seek as _, SeekFrom, Write as _},
     ops::RangeInclusive,
     path::PathBuf,
@@ -12,6 +13,10 @@ use tokio::sync::Mutex;
 use tracing::Instrument as _;
 
 mod blob;
+
+// Bound memory independently of the number of historical partitions. Collisions
+// only serialize unrelated operations; they never weaken same-partition exclusion.
+const METADATA_LOCK_SHARDS: usize = 64;
 
 #[derive(Clone)]
 pub struct Config {
@@ -30,7 +35,7 @@ impl Config {
 
 #[derive(Clone)]
 pub struct Storage {
-    lock: Arc<Mutex<()>>,
+    locks: Arc<[Arc<Mutex<()>>; METADATA_LOCK_SHARDS]>,
     cfg: Config,
     pool: BufferPool,
     hold: Arc<Hold>,
@@ -52,32 +57,45 @@ impl Storage {
             )
         });
         Self {
-            lock: Arc::new(Mutex::new(())),
+            locks: Arc::new(std::array::from_fn(|_| Arc::new(Mutex::new(())))),
             cfg,
             pool,
             hold,
         }
     }
 
-    /// Run `f` to completion on the blocking pool while owning the filesystem
+    fn partition_lock(&self, partition: &str) -> Arc<Mutex<()>> {
+        let mut hasher = DefaultHasher::new();
+        // Validated partition names contain only ASCII. Case aliases must use the
+        // same lock on case-insensitive filesystems, too.
+        for byte in partition.bytes() {
+            hasher.write_u8(byte.to_ascii_lowercase());
+        }
+        self.locks[hasher.finish() as usize % METADATA_LOCK_SHARDS].clone()
+    }
+
+    /// Run `f` to completion on the blocking pool while owning the partition
     /// lock and the directory hold, so dropping the returned future neither
     /// abandons `f` mid-sequence nor lets a successor storage instance
     /// initialize before `f` has finished. A closure dropped unstarted at
     /// runtime shutdown yields [Error::Closed].
     async fn dispatch<T: Send + 'static>(
         &self,
+        lock: Arc<Mutex<()>>,
         f: impl FnOnce() -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let guard = self.lock.clone().lock_owned().instrument(
-            tracing::debug_span!(target: "lifecycle", "storage.metadata.lock_wait")
-        ).await;
+        let guard = lock
+            .lock_owned()
+            .instrument(tracing::debug_span!(target: "lifecycle", "storage.metadata.lock_wait"))
+            .await;
         let hold = self.hold.clone();
         let request = tracing::debug_span!(target: "lifecycle", "storage.metadata.request");
         let queue = tracing::debug_span!(target: "lifecycle", parent: &request, "storage.metadata.blocking_queue");
         let task = tokio::task::spawn_blocking(move || {
             drop(queue);
             let _request = request.enter();
-            let _operation = tracing::debug_span!(target: "lifecycle", "storage.metadata.execute").entered();
+            let _operation =
+                tracing::debug_span!(target: "lifecycle", "storage.metadata.execute").entered();
             let _hold = hold;
             let _guard = guard;
             f()
@@ -93,7 +111,12 @@ impl Storage {
 impl crate::Storage for Storage {
     type Blob = blob::Blob;
 
-    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.open", level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.metadata.open",
+        level = "debug",
+        skip_all
+    )]
     async fn open_versioned(
         &self,
         partition: &str,
@@ -101,6 +124,7 @@ impl crate::Storage for Storage {
         versions: RangeInclusive<BlobVersion>,
     ) -> Result<(Self::Blob, u64, BlobVersion), Error> {
         super::validate_partition_name(partition)?;
+        let lock = self.partition_lock(partition);
 
         // Construct the full path
         let path = self.cfg.storage_directory.join(partition).join(hex(name));
@@ -116,7 +140,7 @@ impl crate::Storage for Storage {
         // must not abandon that sequence half-done (a straggling truncate could
         // clobber a successor's blob) or leave a later open trusting a header
         // whose syncs never ran.
-        self.dispatch(move || {
+        self.dispatch(lock, move || {
             let parent = match path.parent() {
                 Some(parent) => parent,
                 None => return Err(Error::PartitionCreationFailed(partition)),
@@ -169,23 +193,30 @@ impl crate::Storage for Storage {
                         .map_err(|_| Error::WriteFailed)?;
                     file.write_all(&region).map_err(|_| Error::WriteFailed)?;
                     tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_header")
-                        .in_scope(|| file.sync_all()).map_err(|e| {
-                        Error::BlobSyncFailed(partition.clone(), hex(&name), e.into())
-                    })?;
+                        .in_scope(|| file.sync_all())
+                        .map_err(|e| {
+                            Error::BlobSyncFailed(partition.clone(), hex(&name), e.into())
+                        })?;
                     (0, blob_version, data_offset)
                 }
             };
 
-            // Construct the blob while still holding the filesystem lock.
+            // Construct the blob while still holding the partition lock.
             let blob = Self::Blob::new(partition, &name, file, pool, data_offset, hold);
             Ok((blob, logical_size, blob_version))
         })
         .await
     }
 
-    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.remove", level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.metadata.remove",
+        level = "debug",
+        skip_all
+    )]
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
         super::validate_partition_name(partition)?;
+        let lock = self.partition_lock(partition);
 
         let path = self.cfg.storage_directory.join(partition);
         let storage_directory = self.cfg.storage_directory.clone();
@@ -195,7 +226,7 @@ impl crate::Storage for Storage {
         // Run the removal to completion: dropping this future must not abandon
         // the sequence between an unlink and the directory sync that makes it
         // durable.
-        self.dispatch(move || {
+        self.dispatch(lock, move || {
             // Remove all related files
             if let Some(name) = name {
                 let blob_path = path.join(hex(&name));
@@ -215,13 +246,19 @@ impl crate::Storage for Storage {
         .await
     }
 
-    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.scan", level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.metadata.scan",
+        level = "debug",
+        skip_all
+    )]
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         super::validate_partition_name(partition)?;
+        let lock = self.partition_lock(partition);
 
         let path = self.cfg.storage_directory.join(partition);
         let partition = partition.to_string();
-        self.dispatch(move || {
+        self.dispatch(lock, move || {
             // Scan the partition directory
             let entries =
                 fs::read_dir(path).map_err(|_| Error::PartitionMissing(partition.clone()))?;
@@ -273,6 +310,129 @@ mod tests {
     fn random_suffix() -> u64 {
         let mut rng = sys_rng();
         rng.random()
+    }
+
+    #[tokio::test]
+    async fn test_metadata_case_aliases_share_lock() {
+        let storage_directory =
+            env::temp_dir().join(format!("storage_tokio_case_lock_{}", random_suffix()));
+        let storage = Storage::new(
+            Config::new(storage_directory.clone(), Layout::ALL),
+            test_pool(),
+        );
+        assert!(Arc::ptr_eq(
+            &storage.partition_lock("Journal_A-0"),
+            &storage.partition_lock("journal_a-0"),
+        ));
+        drop(storage);
+        std::fs::remove_dir_all(storage_directory).unwrap();
+    }
+
+    /// Removing/recreating one partition must not interfere with another
+    /// partition's blob creation or its data surviving storage-instance restart.
+    #[tokio::test]
+    async fn test_metadata_concurrent_partition_recreation() {
+        let storage_directory =
+            env::temp_dir().join(format!("storage_tokio_recreation_{}", random_suffix()));
+        let config = Config::new(storage_directory.clone(), Layout::ALL);
+        let storage = Storage::new(config.clone(), test_pool());
+        assert!(!Arc::ptr_eq(
+            &storage.partition_lock("journal"),
+            &storage.partition_lock("archive"),
+        ));
+        let journal = async {
+            for i in 0..16u64 {
+                let (blob, size) = storage.open("journal", &i.to_be_bytes()).await.unwrap();
+                assert_eq!(size, 0);
+                blob.write_at(0, i.to_be_bytes().to_vec(), WriteOptions::SYNC)
+                    .await
+                    .unwrap();
+            }
+        };
+        let archive = async {
+            for i in 0..16u64 {
+                let (blob, size) = storage.open("archive", &i.to_be_bytes()).await.unwrap();
+                assert_eq!(size, 0);
+                drop(blob);
+                storage.remove("archive", None).await.unwrap();
+            }
+        };
+        futures::join!(journal, archive);
+        drop(storage);
+        let storage = Storage::new(config, test_pool());
+        for i in 0..16u64 {
+            let (blob, size) = storage.open("journal", &i.to_be_bytes()).await.unwrap();
+            assert_eq!(size, 8);
+            assert_eq!(
+                blob.read_at(0, 8, ReadOptions::default())
+                    .await
+                    .unwrap()
+                    .coalesce()
+                    .as_ref(),
+                &i.to_be_bytes()
+            );
+        }
+        assert!(matches!(
+            storage.scan("archive").await,
+            Err(Error::PartitionMissing(_))
+        ));
+        drop(storage);
+        std::fs::remove_dir_all(storage_directory).unwrap();
+    }
+
+    /// A cancelled caller must retain same-partition exclusion until its blocking
+    /// operation finishes, while unrelated partitions can continue opening blobs.
+    #[tokio::test]
+    async fn test_metadata_partition_isolation_after_cancellation() {
+        let storage_directory =
+            env::temp_dir().join(format!("storage_tokio_partition_locks_{}", random_suffix()));
+        let storage = Storage::new(
+            Config::new(storage_directory.clone(), Layout::ALL),
+            test_pool(),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = storage.clone();
+        let task = tokio::spawn(async move {
+            worker
+                .dispatch(worker.partition_lock("journal"), move || {
+                    let _ = started_tx.send(());
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let mut same_partition = Box::pin(storage.open("journal", b"same"));
+        assert!((&mut same_partition).now_or_never().is_none());
+        let independent = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            storage.open("archive", b"other"),
+        )
+        .await;
+        let same_partition_waiting = (&mut same_partition).now_or_never().is_none();
+        let same_partition_untouched = !storage_directory.join("journal").exists();
+        // Always release the blocking worker, including when the assertion fails.
+        release_tx.send(()).unwrap();
+        assert!(
+            same_partition_waiting,
+            "same-partition open bypassed the lock"
+        );
+        assert!(
+            same_partition_untouched,
+            "same-partition open mutated storage early"
+        );
+        let (other, size) = independent
+            .expect("unrelated partition was blocked")
+            .unwrap();
+        assert_eq!(size, 0);
+        let (same, size) = same_partition.await.unwrap();
+        assert_eq!(size, 0);
+        drop((same, other, storage));
+        std::fs::remove_dir_all(storage_directory).unwrap();
     }
 
     #[tokio::test]
