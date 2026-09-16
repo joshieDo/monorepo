@@ -6260,6 +6260,65 @@ mod tests {
     }
 
     #[test_traced("WARN")]
+    fn test_standard_cached_notarized_delivery_preserves_validation() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+        runner.start(|mut context| async move {
+            let Fixture { schemes, .. } =
+                bls12381_threshold_vrf::fixture::<V, _>(&mut context, NAMESPACE, NUM_VALIDATORS);
+            let round = Round::new(Epoch::zero(), View::new(2));
+            let block = make_raw_block(Sha256::hash(&[b""]), Height::new(1), 100);
+            let other = make_raw_block(Sha256::hash(&[b""]), Height::new(1), 101);
+            let notarization = StandardHarness::make_notarization(
+                Proposal::new(round, View::zero(), StandardHarness::commitment(&block)),
+                &schemes,
+                QUORUM,
+            );
+            let (mailbox, _buffer, resolver, _actor_handle) = start_standard_actor(
+                context.child("validator"),
+                "cached-notarized-delivery-validation",
+                ConstantProvider::new(schemes[0].clone()),
+                Application::<B>::manual_ack(),
+                Some(RecordingBuffer::default()),
+                Start::Genesis(StandardHarness::genesis_block(NUM_VALIDATORS as u16)),
+            )
+            .await;
+            assert!(mailbox.verified(round, block.clone()).await);
+
+            let valid = (notarization.clone(), block.clone()).encode();
+            let mut trailing = valid.to_vec();
+            trailing.push(0);
+            let mut invalid_certificate = notarization.clone();
+            invalid_certificate.proposal.parent = View::new(1);
+            let mut wrong_round = notarization.clone();
+            wrong_round.proposal.round = Round::new(Epoch::zero(), View::new(3));
+            for (label, value, expected) in [
+                ("missing body", notarization.encode(), false),
+                ("trailing bytes", Bytes::from(trailing), false),
+                ("different commitment", (notarization.clone(), other).encode(), false),
+                ("invalid certificate", (invalid_certificate, block.clone()).encode(), false),
+                ("wrong round", (wrong_round, block.clone()).encode(), false),
+                ("exact cached bytes", valid, true),
+            ] {
+                let (response, response_rx) = oneshot::channel();
+                assert!(resolver.enqueue(handler::Message::Deliver {
+                    delivery: Delivery {
+                        key: handler::Key::Notarized { round },
+                        subscribers: NonEmptyVec::new((
+                            handler::Annotation::Notarization { round },
+                            tracing::Span::none(),
+                        )),
+                    },
+                    value,
+                    response,
+                }).accepted());
+                assert_eq!(response_rx.await.expect("delivery response missing"), expected, "{label}");
+            }
+            let recovered = mailbox.get_block(&block.digest()).await.unwrap();
+            assert_eq!(recovered.digest(), block.digest());
+        });
+    }
+
+    #[test_traced("WARN")]
     fn test_standard_notarized_delivery_rejects_wrong_round() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
         runner.start(|mut context| async move {

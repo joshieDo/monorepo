@@ -3,7 +3,7 @@ use super::{
     acks::{PendingAck, PendingAcks},
     cache,
     decoded::DecodedBlocks,
-    delivery::PendingVerification,
+    delivery::{PendingVerification, decode_cached_delivery},
     durability::{DispatchGate, Durable as _},
     floor::{Floor, State as FloorState},
     mailbox::{CommitmentFallback, Mailbox, Message},
@@ -1644,7 +1644,11 @@ where
                     return self;
                 }
                 let block_cfg = V::block_cfg(&self.block_codec_config, commitment);
-                let Ok(block) = V::Block::decode_cfg(value, &block_cfg) else {
+                // A resolver response can arrive after broadcast supplied this
+                // block. Exact bytes are required: commitment equality alone
+                // must not make an invalid remote encoding acceptable.
+                let cached = self.decoded_blocks.lock().by_commitment(&commitment);
+                let Ok(block) = decode_cached_delivery(value, &block_cfg, cached) else {
                     response.send_lossy(false);
                     return self;
                 };
