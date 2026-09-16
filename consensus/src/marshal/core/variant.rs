@@ -33,6 +33,14 @@ pub struct Retirement<C> {
 
 /// A marker trait describing the types used by a variant of Marshal.
 pub trait Variant: Clone + Send + Sync + 'static {
+    /// Whether an exactly matching cached encoding may replace wire decoding.
+    ///
+    /// Opting in requires every cached working block, including blocks converted
+    /// from application or stored blocks, to satisfy all wire-decoder invariants
+    /// under this actor's block configuration. Trusted commitments alone do not
+    /// establish this property. Payload and certificate checks still apply.
+    const REUSE_CACHED_DELIVERY: bool = false;
+
     /// The working block type of marshal, supporting the consensus commitment.
     ///
     /// Must be convertible to `StoredBlock` via `Into` for archival.

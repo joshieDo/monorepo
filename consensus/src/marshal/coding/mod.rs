@@ -657,6 +657,51 @@ mod tests {
     }
 
     #[test_traced("WARN")]
+    fn test_coding_cached_notarized_delivery_rejects_trusted_wrong_root() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+        runner.start(|mut context| async move {
+            let Fixture { participants, schemes, .. } =
+                bls12381_threshold_vrf::fixture::<V, _>(&mut context, NAMESPACE, NUM_VALIDATORS);
+            let (marshal, resolver, _actor_handle) = start_coding_actor_with_recording(
+                context.child("actor_stack"),
+                "coding-cached-trusted-wrong-root",
+                ConstantProvider::new(schemes[0].clone()),
+                RecordingCodingBuffer::default(),
+            ).await;
+            let resolver_tx = resolver.sender.clone().unwrap();
+            let (ctx, honest) = missing_candidate(participants[0].clone());
+            let commitment = honest.commitment();
+            let wrong_root = Sha256::hash(&[b"wrong cached coding root"]);
+            assert_ne!(wrong_root, commitment.root());
+            let expected = TestCommitment::from((
+                commitment.block(), wrong_root, commitment.context(), commitment.config(),
+            ));
+            // Storage/finalized conversions can reconstruct a trusted coded
+            // block without rerunning the wire decoder's erasure-root check.
+            let trusted = TestCodedBlock::new_trusted(honest.inner().clone(), expected);
+            assert_eq!(trusted.commitment(), expected);
+            assert_eq!(trusted.encode(), honest.encode());
+            assert!(marshal.verified(ctx.round, trusted.clone()).await);
+            let notarization = CodingHarness::make_notarization(
+                Proposal::new(ctx.round, View::zero(), expected), &schemes, QUORUM,
+            );
+            let (response, response_rx) = oneshot::channel();
+            assert!(resolver_tx.enqueue(handler::Message::Deliver {
+                delivery: Delivery {
+                    key: handler::Key::Notarized { round: ctx.round },
+                    subscribers: NonEmptyVec::new((
+                        handler::Annotation::Notarization { round: ctx.round },
+                        tracing::Span::none(),
+                    )),
+                },
+                value: (notarization, trusted).encode(),
+                response,
+            }).accepted());
+            assert!(!response_rx.await.unwrap(), "cached bytes must not bypass erasure-root validation");
+        });
+    }
+
+    #[test_traced("WARN")]
     fn test_coding_notarized_delivery_rejects_dishonest_payload_config() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
         runner.start(|mut context| async move {

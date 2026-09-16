@@ -1647,7 +1647,11 @@ where
                 // A resolver response can arrive after broadcast supplied this
                 // block. Exact bytes are required: commitment equality alone
                 // must not make an invalid remote encoding acceptable.
-                let cached = self.decoded_blocks.lock().by_commitment(&commitment);
+                let cached = if V::REUSE_CACHED_DELIVERY {
+                    self.decoded_blocks.lock().by_commitment(&commitment)
+                } else {
+                    None
+                };
                 let Ok(block) = decode_cached_delivery(value, &block_cfg, cached) else {
                     response.send_lossy(false);
                     return self;
