@@ -344,7 +344,16 @@ impl crate::Blob for Blob {
         };
         let partition = sync.then(|| self.partition.clone());
         let name = sync.then(|| self.name.clone());
+        let request = if sync {
+            tracing::debug_span!(target: "lifecycle", "storage.blob.sync_write_request")
+        } else {
+            tracing::Span::none()
+        };
+        let queue = sync.then(|| tracing::debug_span!(target: "lifecycle", parent: &request, "storage.blob.sync_write_queue"));
         task::spawn_blocking(move || {
+            drop(queue);
+            let _request = request.enter();
+            let _write = sync.then(|| tracing::debug_span!(target: "lifecycle", "storage.blob.sync_write").entered());
             // Preserve the single-buffer fast path when no option requires per-write flags.
             let bufs = if !sync && !cache.is_disabled() {
                 match bufs.try_into_single() {
