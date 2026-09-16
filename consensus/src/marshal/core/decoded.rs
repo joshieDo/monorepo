@@ -57,12 +57,15 @@ impl<C: Eq, D: Eq, B> DecodedBlocks<C, D, B> {
     /// Grant height provenance only after confirmed insertion of this block.
     /// The caller must still gate application dispatch on archive durability.
     pub(super) fn confirm_finalized(&mut self, commitment: &C, height: Height) {
-        if let Some(entry) = self
+        // A store may prune internally before accepting a replacement at a
+        // formerly cached height. Only the newly confirmed commitment can
+        // retain height provenance, even if that commitment was evicted here.
+        for entry in self
             .entries
             .iter_mut()
-            .find(|entry| &entry.commitment == commitment && entry.height == height)
+            .filter(|entry| entry.height == height)
         {
-            entry.finalized = true;
+            entry.finalized = &entry.commitment == commitment;
         }
     }
 
@@ -163,6 +166,21 @@ mod tests {
         cache.confirm_finalized(&(1, 7), Height::new(1));
         assert!(cache.by_height(Height::new(1)).is_none());
         assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn decoded_cache_confirmed_replacement_revokes_old_height_provenance() {
+        let mut cache = DecodedBlocks::new(3, 100);
+        cache.insert((1, 7), 1, Arc::new(7), 4, Height::new(1), true);
+        cache.insert((1, 8), 1, Arc::new(8), 4, Height::new(1), false);
+        cache.confirm_finalized(&(1, 8), Height::new(1));
+        assert_eq!(*cache.by_height(Height::new(1)).unwrap(), 8);
+        assert!(cache.by_commitment(&(1, 7)).is_some());
+        // The new input was not retained, so height lookup must use storage.
+        cache.confirm_finalized(&(1, 9), Height::new(1));
+        assert!(cache.by_height(Height::new(1)).is_none());
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.bytes, 8);
     }
 
     #[test]
