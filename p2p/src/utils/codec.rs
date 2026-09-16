@@ -57,7 +57,12 @@ impl<S: Sender, V: Codec> WrappedSender<S, V> {
     }
 
     /// Send a borrowed message to a set of recipients.
-    #[tracing::instrument(name = "network.codec.send_ref", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.codec.send_ref",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     pub fn send_ref(
         &mut self,
         recipients: Recipients<S::PublicKey>,
@@ -101,7 +106,12 @@ impl<'a, S: Sender, V: Codec> CheckedWrappedSender<'a, S, V> {
         self.send_ref(&message, priority)
     }
 
-    #[tracing::instrument(name = "network.codec.send_ref", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.codec.send_ref",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     pub fn send_ref(self, message: &V, priority: bool) -> Unreliable<Feedback> {
         let encoded = message.encode_with_pool(self.pool);
         self.sender.send(encoded, priority)
@@ -121,10 +131,22 @@ impl<R: Receiver, V: Codec> WrappedReceiver<R, V> {
     }
 
     /// Receive a message from an arbitrary recipient.
-    #[tracing::instrument(name = "network.codec.recv", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.codec.recv",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     pub async fn recv(&mut self) -> Result<WrappedMessage<R::PublicKey, V>, R::Error> {
-        let (pk, bytes) = self.receiver.recv().await?;
-        let decoded = match V::decode_cfg(bytes.as_ref(), &self.config) {
+        let ((pk, bytes), receive_id) = self.receiver.recv_with_context().await?;
+        if let Some(receive_id) = receive_id {
+            tracing::info!(target: "lifecycle", stage = "message_decode", receive_id);
+        }
+        let result = V::decode_cfg(bytes.as_ref(), &self.config);
+        if let Some(receive_id) = receive_id {
+            tracing::info!(target: "lifecycle", stage = "message_decode_result", receive_id, accepted = u64::from(result.is_ok()));
+        }
+        let decoded = match result {
             Ok(decoded) => decoded,
             Err(e) => {
                 return Ok((pk, Err(e)));
@@ -144,7 +166,7 @@ impl<R: Receiver, V: Codec> WrappedReceiver<R, V> {
 /// reading more bytes. Successfully decoded messages are forwarded through a bounded mailbox; if
 /// the consumer falls behind and the mailbox fills, additional decoded messages are dropped (they
 /// would likely no longer be useful by the time we get back to them).
-struct Decoded<P: PublicKey, V>(P, V);
+struct Decoded<P: PublicKey, V>(P, V, Option<u64>);
 
 impl<P: PublicKey, V> mailbox::UnreliablePolicy for Decoded<P, V> {
     type Overflow = VecDeque<Self>;
@@ -161,12 +183,22 @@ pub struct BackgroundReceiver<P: PublicKey, V> {
 
 impl<P: PublicKey, V> BackgroundReceiver<P, V> {
     /// Receive the next successfully decoded message.
-    #[tracing::instrument(name = "network.codec.recv", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.codec.recv",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     pub async fn recv(&mut self) -> Option<(P, V)> {
         self.receiver
             .recv()
             .await
-            .map(|Decoded(peer, value)| (peer, value))
+            .map(|Decoded(peer, value, receive_id)| {
+                if let Some(receive_id) = receive_id {
+                    tracing::info!(target: "lifecycle", stage = "message_delivered", receive_id);
+                }
+                (peer, value)
+            })
     }
 }
 
@@ -258,14 +290,21 @@ where
                 Self::handle_decode_result(&mut self.blocker, &mut self.sender, result);
             },
             // Receive raw bytes and submit decode work to the strategy.
-            Ok((peer, bytes)) = self.receiver.recv() else {
+            Ok(((peer, bytes), receive_id)) = self.receiver.recv_with_context() else {
                 receiver_closed = true;
                 continue;
             } => {
                 let config = self.codec_config.clone();
                 let handle = self.strategy.spawn(bytes.len(), move |_| {
+                    let _decode = tracing::debug_span!(target: "lifecycle", "network.codec.decode", receive_id = receive_id.unwrap_or(0)).entered();
+                    if let Some(receive_id) = receive_id {
+                        tracing::info!(target: "lifecycle", stage = "message_decode", receive_id);
+                    }
                     let result = V::decode_cfg(bytes.as_ref(), &config);
-                    (peer, result)
+                    if let Some(receive_id) = receive_id {
+                        tracing::info!(target: "lifecycle", stage = "message_decode_result", receive_id, accepted = u64::from(result.is_ok()));
+                    }
+                    (peer, result, receive_id)
                 });
                 decode_pool.push(handle);
             },
@@ -275,12 +314,15 @@ where
     fn handle_decode_result(
         blocker: &mut B,
         sender: &mut mailbox::UnreliableSender<Decoded<P, V>>,
-        result: (P, Result<V, commonware_codec::Error>),
+        result: (P, Result<V, commonware_codec::Error>, Option<u64>),
     ) {
-        let (peer, decode_result) = result;
+        let (peer, decode_result, receive_id) = result;
         match decode_result {
             Ok(value) => {
-                let _ = sender.enqueue(Decoded(peer, value));
+                let feedback = sender.enqueue(Decoded(peer, value, receive_id));
+                if let Some(receive_id) = receive_id {
+                    tracing::info!(target: "lifecycle", stage = "message_decoded_queue", receive_id, accepted = u64::from(feedback.accepted()));
+                }
             }
             Err(err) => {
                 crate::block!(blocker, peer, ?err, "received invalid message");
@@ -372,7 +414,12 @@ mod tests {
         type Error = io::Error;
         type PublicKey = P;
 
-        #[tracing::instrument(name = "network.codec.recv", target = "lifecycle", level = "debug", skip_all)]
+        #[tracing::instrument(
+            name = "network.codec.recv",
+            target = "lifecycle",
+            level = "debug",
+            skip_all
+        )]
         async fn recv(&mut self) -> Result<crate::Message<Self::PublicKey>, Self::Error> {
             self.receiver
                 .recv()
@@ -391,7 +438,12 @@ mod tests {
         type Error = io::Error;
         type PublicKey = P;
 
-        #[tracing::instrument(name = "network.codec.recv", target = "lifecycle", level = "debug", skip_all)]
+        #[tracing::instrument(
+            name = "network.codec.recv",
+            target = "lifecycle",
+            level = "debug",
+            skip_all
+        )]
         async fn recv(&mut self) -> Result<crate::Message<Self::PublicKey>, Self::Error> {
             self.received.fetch_add(1, Ordering::SeqCst);
             self.receiver
@@ -758,6 +810,118 @@ mod tests {
             values.sort_unstable();
 
             assert_eq!(values, (0..count).collect::<Vec<u32>>());
+        });
+    }
+    #[derive(Debug)]
+    struct ContextReceiver {
+        receiver: mpsc::UnboundedReceiver<(crate::Message<PublicKey>, Option<u64>)>,
+    }
+    impl crate::Receiver for ContextReceiver {
+        type Error = io::Error;
+        type PublicKey = PublicKey;
+        async fn recv(&mut self) -> Result<crate::Message<PublicKey>, io::Error> {
+            self.recv_with_context().await.map(|(value, _)| value)
+        }
+        async fn recv_with_context(
+            &mut self,
+        ) -> Result<(crate::Message<PublicKey>, Option<u64>), io::Error> {
+            self.receiver
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn test_lineage_background_malformed_and_overflow_keep_payload_context() {
+        deterministic::Runner::default().start(|context| async move {
+            let peer = pk(0);
+            let (tx, receiver) = mpsc::unbounded_channel();
+            for (bytes, id) in [
+                (IoBuf::from(1u32.encode()), 11),
+                (IoBuf::from(b"bad"), 99),
+                (IoBuf::from(2u32.encode()), 22),
+                (IoBuf::from(3u32.encode()), 33),
+            ] {
+                tx.send(((peer.clone(), bytes), Some(id))).unwrap();
+            }
+            drop(tx);
+            let (bg, mut rx) = WrappedBackgroundReceiver::<_, _, _, _, u32, _>::new(
+                context.child("bg"),
+                ContextReceiver { receiver },
+                (),
+                NoopBlocker,
+                NZUsize!(2),
+                Sequential,
+            );
+            bg.start().await.unwrap();
+            for (expected, id) in [(1, 11), (2, 22)] {
+                let Decoded(from, value, context) = rx.receiver.recv().await.unwrap();
+                assert_eq!((from, value, context), (peer.clone(), expected, Some(id)));
+            }
+            assert!(rx.receiver.recv().await.is_none());
+        });
+    }
+
+    #[test]
+    fn test_lineage_reordered_results_and_rejection_do_not_swap_ids() {
+        deterministic::Runner::default().start(|context| async move {
+            let (mut tx, mut rx) = mailbox::new_unreliable(context.child("results"), NZUsize!(2));
+            let mut blocker = NoopBlocker;
+            type Decoder = WrappedBackgroundReceiver<
+                deterministic::Context,
+                PublicKey,
+                NoopBlocker,
+                ContextReceiver,
+                u32,
+                Sequential,
+            >;
+            // Completion order differs from submission order, with a malformed neighbor.
+            Decoder::handle_decode_result(&mut blocker, &mut tx, (pk(0), Ok(20), Some(2)));
+            Decoder::handle_decode_result(
+                &mut blocker,
+                &mut tx,
+                (pk(0), Err(commonware_codec::Error::EndOfBuffer), Some(3)),
+            );
+            Decoder::handle_decode_result(&mut blocker, &mut tx, (pk(0), Ok(10), Some(1)));
+            Decoder::handle_decode_result(&mut blocker, &mut tx, (pk(0), Ok(40), Some(4)));
+            for (value, id) in [(20, 2), (10, 1)] {
+                let Decoded(_, actual, context) = rx.recv().await.unwrap();
+                assert_eq!((actual, context), (value, Some(id)));
+            }
+            assert!(rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn test_lineage_default_receiver_and_cancelled_pending_decode() {
+        deterministic::Runner::default().start(|context| async move {
+            let (tx, receiver) = mpsc::unbounded_channel();
+            tx.send((pk(0), IoBuf::from(7u32.encode()))).unwrap();
+            let mut legacy = MockReceiver { receiver };
+            let ((_, bytes), context_id) = legacy.recv_with_context().await.unwrap();
+            assert_eq!(bytes, IoBuf::from(7u32.encode()));
+            assert_eq!(context_id, None);
+            let (tx, receiver) = mpsc::unbounded_channel();
+            tx.send(((pk(0), IoBuf::from(8u32.encode())), Some(8)))
+                .unwrap();
+            let (bg, mut rx) = WrappedBackgroundReceiver::<_, _, _, _, u32, _>::new(
+                context.child("pending"),
+                ContextReceiver { receiver },
+                (),
+                NoopBlocker,
+                NZUsize!(2),
+                mocks::pending(NZUsize!(2)),
+            );
+            let handle = bg.start();
+            context.sleep(Duration::from_millis(1)).await;
+            assert!(rx.receiver.try_recv().is_err());
+            drop(handle);
+            context.sleep(Duration::from_millis(1)).await;
+            assert!(
+                rx.receiver.try_recv().is_err(),
+                "cancelled jobs must not fabricate delivery"
+            );
         });
     }
 }

@@ -14,10 +14,10 @@ use commonware_codec::Decode;
 use commonware_cryptography::PublicKey;
 use commonware_macros::{select, select_loop};
 use commonware_runtime::{
-    BufferPooler, Clock, Handle, IoBufs, Metrics, Quota, RateLimiter, Sink, Spawner, Stream,
+    BufferPooler, Clock, Handle, Metrics, Quota, RateLimiter, Sink, Spawner, Stream,
     iobuf::EncodeExt, telemetry::metrics::CounterFamily,
 };
-use commonware_stream::encrypted::{Receiver, Sender};
+use commonware_stream::encrypted::{MessageWithContext, Receiver, Sender};
 use commonware_utils::time::SYSTEM_TIME_PRECISION;
 use rand_core::CryptoRng;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -74,7 +74,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
         peer: &C,
         msg: Message<C>,
         pool: &commonware_runtime::BufferPool,
-    ) -> Result<(metrics::Message<C>, IoBufs), Error> {
+    ) -> Result<(metrics::Message<C>, MessageWithContext), Error> {
         let (metric, payload) = match msg {
             Message::BitVec(bit_vec) => (
                 metrics::Message::new_bit_vec(peer),
@@ -86,7 +86,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
             ),
             Message::Kill => return Err(Error::PeerKilled(peer.to_string())),
         };
-        Ok((metric, payload.encode_with_pool(pool)))
+        Ok((metric, (payload.encode_with_pool(pool), None)))
     }
 
     /// Converts pre-encoded data into an outbound metric/payload pair.
@@ -94,20 +94,20 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
         peer: &C,
         msg: EncodedData,
         rate_limits: &HashMap<u64, V>,
-    ) -> (metrics::Message<C>, IoBufs) {
+    ) -> (metrics::Message<C>, MessageWithContext) {
         let encoded = msg.validate_channel(rate_limits);
         (
             metrics::Message::new_data(peer, encoded.channel),
-            encoded.payload,
+            (encoded.payload, encoded.message_id),
         )
     }
 
     /// Records the send metric and appends the payload to the batch.
     fn push_batched(
         sent_messages: &CounterFamily<metrics::Message<C>>,
-        batch: &mut Vec<IoBufs>,
+        batch: &mut Vec<MessageWithContext>,
         metric: metrics::Message<C>,
-        payload: IoBufs,
+        payload: MessageWithContext,
     ) {
         sent_messages.get_or_create(&metric).inc();
         batch.push(payload);
@@ -122,7 +122,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
     fn extend_send_many<V>(
         peer: &C,
         batch_size: usize,
-        batch: &mut Vec<IoBufs>,
+        batch: &mut Vec<MessageWithContext>,
         control: &mut mailbox::UnreliableReceiver<Message<C>>,
         pool: &commonware_runtime::BufferPool,
         high: &mut mailbox::UnreliableReceiver<RelayMessage<EncodedData>>,
@@ -230,7 +230,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                             &self.sent_messages,
                         )?;
                         conn_sender
-                            .send_many(batch.drain(..))
+                            .send_many_with_context(batch.drain(..))
                             .await
                             .map_err(Error::SendFailed)?;
                     },
@@ -256,7 +256,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                 let mut first_peers_received = false;
                 loop {
                     // Receive a message from the peer
-                    let msg = conn_receiver.recv().await.map_err(Error::ReceiveFailed)?;
+                    let (msg, receive_id) = conn_receiver.recv_with_context().await.map_err(Error::ReceiveFailed)?;
 
                     // Parse the message
                     let cfg = types::PayloadConfig {
@@ -360,7 +360,10 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                             // processing of gossip messages (BitVec, Peers), causing the
                             // peer connection to stall and potentially disconnect.
                             let sender = senders.get_mut(&data.channel).unwrap();
-                            let _ = sender.enqueue(channels::Inbound((peer.clone(), data.message)));
+                            let feedback = sender.enqueue(channels::Inbound((peer.clone(), data.message), receive_id));
+                                if let Some(receive_id) = receive_id {
+                                    tracing::info!(target: "lifecycle", stage = "message_inbound_queue", receive_id, accepted = u64::from(feedback.accepted()));
+                                }
                         }
                         types::Payload::Greeting(_) => unreachable!(),
                         types::Payload::BitVec(bit_vec) => {

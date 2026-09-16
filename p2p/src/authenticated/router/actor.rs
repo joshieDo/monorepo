@@ -46,7 +46,11 @@ impl<E: Spawner + Metrics, P: PublicKey> Actor<E, P> {
     /// Sends pre-encoded data to the given `recipient`.
     fn send(&mut self, recipient: P, encoded: EncodedData, priority: bool) {
         if let Some(relay) = self.connections.get_mut(&recipient) {
-            let _ = relay.send(encoded, priority);
+            let message_id = encoded.message_id;
+            let feedback = relay.send(encoded, priority);
+            if let Some(message_id) = message_id {
+                tracing::info!(target: "lifecycle", stage = "message_peer_queue", message_id, accepted = u64::from(feedback.accepted()));
+            }
         }
     }
 
@@ -64,7 +68,10 @@ impl<E: Spawner + Metrics, P: PublicKey> Actor<E, P> {
             Recipients::All => {
                 // Send to all connected peers
                 for relay in self.connections.values_mut() {
-                    let _ = relay.send(encoded.clone(), priority);
+                    let feedback = relay.send(encoded.clone(), priority);
+                    if let Some(message_id) = encoded.message_id {
+                        tracing::info!(target: "lifecycle", stage = "message_peer_queue", message_id, accepted = u64::from(feedback.accepted()));
+                    }
                 }
             }
         }

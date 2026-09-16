@@ -10,10 +10,10 @@ use commonware_codec::Decode;
 use commonware_cryptography::PublicKey;
 use commonware_macros::{select, select_loop};
 use commonware_runtime::{
-    BufferPooler, Clock, Handle, IoBufs, Metrics, Quota, RateLimiter, Sink, Spawner, Stream,
+    BufferPooler, Clock, Handle, Metrics, Quota, RateLimiter, Sink, Spawner, Stream,
     iobuf::EncodeExt, telemetry::metrics::CounterFamily,
 };
-use commonware_stream::encrypted::{Receiver, Sender};
+use commonware_stream::encrypted::{MessageWithContext, Receiver, Sender};
 use commonware_utils::{channel::ring, time::SYSTEM_TIME_PRECISION};
 use futures::{FutureExt as _, StreamExt as _};
 use rand_core::CryptoRng;
@@ -59,25 +59,30 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
     }
 
     /// Converts pre-encoded data into an outbound metric/payload pair.
-    #[tracing::instrument(name = "network.peer.prepare_data", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.peer.prepare_data",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn prepare_data<V>(
         peer: &C,
         msg: EncodedData,
         rate_limits: &HashMap<u64, V>,
-    ) -> (metrics::Message<C>, IoBufs) {
+    ) -> (metrics::Message<C>, MessageWithContext) {
         let encoded = msg.validate_channel(rate_limits);
         (
             metrics::Message::new_data(peer, encoded.channel),
-            encoded.payload,
+            (encoded.payload, encoded.message_id),
         )
     }
 
     /// Records the send metric and appends the payload to the batch.
     fn push_batched(
         sent_messages: &CounterFamily<metrics::Message<C>>,
-        batch: &mut Vec<IoBufs>,
+        batch: &mut Vec<MessageWithContext>,
         metric: metrics::Message<C>,
-        payload: IoBufs,
+        payload: MessageWithContext,
     ) {
         sent_messages.get_or_create(&metric).inc();
         batch.push(payload);
@@ -93,11 +98,16 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
     /// already ready (via `try_recv`), so this reduces runtime write calls
     /// without introducing a per-connection timer or extra buffering latency.
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(name = "network.peer.extend_send_many", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.peer.extend_send_many",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn extend_send_many<V>(
         peer: &C,
         batch_size: usize,
-        batch: &mut Vec<IoBufs>,
+        batch: &mut Vec<MessageWithContext>,
         control: &mut ring::Receiver<Message>,
         high: &mut mailbox::UnreliableReceiver<RelayMessage<EncodedData>>,
         low: &mut mailbox::UnreliableReceiver<RelayMessage<EncodedData>>,
@@ -125,7 +135,12 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
         Ok(())
     }
 
-    #[tracing::instrument(name = "network.peer.recv_prioritized", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.peer.recv_prioritized",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     async fn recv_prioritized(
         control: &mut ring::Receiver<Message>,
         high: &mut mailbox::UnreliableReceiver<RelayMessage<EncodedData>>,
@@ -192,7 +207,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                             &self.sent_messages,
                             &mut batch,
                             metrics::Message::new_ping(&peer),
-                            types::Message::Ping.encode_with_pool(&pool),
+                            (types::Message::Ping.encode_with_pool(&pool), None),
                         );
                         Self::extend_send_many(
                             &peer,
@@ -205,7 +220,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                             &self.sent_messages,
                         )?;
                         conn_sender
-                            .send_many(batch.drain(..))
+                            .send_many_with_context(batch.drain(..))
                             .await
                             .map_err(Error::SendFailed)?;
                         deadline = context.current() + self.ping_frequency;
@@ -241,7 +256,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                             &self.sent_messages,
                         )?;
                         conn_sender
-                            .send_many(batch.drain(..))
+                            .send_many_with_context(batch.drain(..))
                             .await
                             .map_err(Error::SendFailed)?;
                     },
@@ -256,7 +271,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                 .spawn(move |context| async move {
                     loop {
                         // Receive a message from the peer
-                        let msg = conn_receiver.recv().await.map_err(Error::ReceiveFailed)?;
+                        let (msg, receive_id) = conn_receiver.recv_with_context().await.map_err(Error::ReceiveFailed)?;
 
                         // Parse the message
                         let max_data_length = msg.len(); // apply loose bound to data read to prevent memory exhaustion
@@ -307,8 +322,10 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                                 // processing of Ping messages, causing the peer connection to
                                 // stall and potentially disconnect.
                                 let sender = senders.get_mut(&data.channel).unwrap();
-                                let _ =
-                                    sender.enqueue(channels::Inbound((peer.clone(), data.message)));
+                                let feedback = sender.enqueue(channels::Inbound((peer.clone(), data.message), receive_id));
+                                if let Some(receive_id) = receive_id {
+                                    tracing::info!(target: "lifecycle", stage = "message_inbound_queue", receive_id, accepted = u64::from(feedback.accepted()));
+                                }
                             }
                             types::Message::Ping => {
                                 // We ignore ping messages, they are only used to keep
