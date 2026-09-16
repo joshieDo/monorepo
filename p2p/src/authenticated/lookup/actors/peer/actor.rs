@@ -59,6 +59,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
     }
 
     /// Converts pre-encoded data into an outbound metric/payload pair.
+    #[tracing::instrument(name = "network.peer.prepare_data", target = "lifecycle", level = "debug", skip_all)]
     fn prepare_data<V>(
         peer: &C,
         msg: EncodedData,
@@ -92,6 +93,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
     /// already ready (via `try_recv`), so this reduces runtime write calls
     /// without introducing a per-connection timer or extra buffering latency.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "network.peer.extend_send_many", target = "lifecycle", level = "debug", skip_all)]
     fn extend_send_many<V>(
         peer: &C,
         batch_size: usize,
@@ -123,6 +125,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
         Ok(())
     }
 
+    #[tracing::instrument(name = "network.peer.recv_prioritized", target = "lifecycle", level = "debug", skip_all)]
     async fn recv_prioritized(
         control: &mut ring::Receiver<Message>,
         high: &mut mailbox::UnreliableReceiver<RelayMessage<EncodedData>>,

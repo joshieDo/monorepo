@@ -58,6 +58,7 @@ pub(crate) fn append_frame(
 /// chunked `IoBufs`.
 ///
 /// Returns an error if the message is too large or the sink is closed.
+#[tracing::instrument(name = "network.frame.send_frame", target = "lifecycle", level = "debug", skip_all)]
 pub async fn send_frame<S: Sink>(
     sink: &mut S,
     bufs: impl Into<IoBufs> + Send,
@@ -75,6 +76,7 @@ pub async fn send_frame<S: Sink>(
 /// Receives data from the stream with a varint length prefix.
 /// Returns an error if the message is too large, the varint is invalid, or the
 /// stream is closed.
+#[tracing::instrument(name = "network.frame.recv_frame", target = "lifecycle", level = "debug", skip_all)]
 pub async fn recv_frame<T: Stream>(stream: &mut T, max_message_size: u32) -> Result<IoBufs, Error> {
     let (len, skip) = recv_length(stream).await?;
     if len > max_message_size as usize {

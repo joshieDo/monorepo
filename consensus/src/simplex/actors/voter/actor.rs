@@ -301,6 +301,7 @@ impl<
     ///
     /// Callers must first sync pending journal appends. Otherwise a restart may
     /// forget the vote and sign a conflicting one, allowing conflicting certificates.
+    #[tracing::instrument(name = "simplex.voter.publish_vote", target = "lifecycle", level = "debug", skip_all)]
     fn publish_vote<T: Sender>(
         &mut self,
         batcher: &mut batcher::Mailbox<S, D>,
@@ -319,6 +320,11 @@ impl<
         };
         self.outbound_messages.get_or_create(metric).inc();
 
+        match &vote {
+            Vote::Notarize(vote) => tracing::info!(target: "lifecycle", stage = "notarize_vote_sent", block_hash = %vote.proposal.payload),
+            Vote::Finalize(vote) => tracing::info!(target: "lifecycle", stage = "finalize_vote_sent", block_hash = %vote.proposal.payload),
+            Vote::Nullify(_) => {},
+        }
         // Broadcast vote
         sender.send(Recipients::All, vote, true);
     }
@@ -327,6 +333,7 @@ impl<
     ///
     /// Callers must sync pending journal appends first (via [Self::sync_journal])
     /// so any state we advertise to the network survives a restart.
+    #[tracing::instrument(name = "simplex.voter.broadcast_certificate", target = "lifecycle", level = "debug", skip_all)]
     fn broadcast_certificate<T: Sender>(
         &mut self,
         sender: &mut WrappedSender<T, Certificate<S, D>>,
@@ -354,6 +361,7 @@ impl<
 
     /// Attempt to propose a new block.
     #[allow(clippy::async_yields_async)]
+    #[tracing::instrument(name = "simplex.voter.try_propose", target = "lifecycle", level = "debug", skip_all)]
     async fn try_propose(&mut self) -> Option<Request<Context<D, S::PublicKey>, D>> {
         // Check if we are ready to propose
         let context = self.state.try_propose()?;
@@ -376,6 +384,7 @@ impl<
 
     /// Attempt to verify a proposed block.
     #[allow(clippy::async_yields_async)]
+    #[tracing::instrument(name = "simplex.voter.try_verify", target = "lifecycle", level = "debug", skip_all)]
     async fn try_verify(
         &mut self,
         resolver: &mut resolver::Mailbox<S, D>,
@@ -499,17 +508,21 @@ impl<
     }
 
     /// Persists our notarize vote to the journal for crash recovery.
+    #[tracing::instrument(name = "simplex.voter.handle_notarize", target = "lifecycle", level = "debug", skip_all)]
     async fn handle_notarize(self, notarize: Notarize<S, D>) -> Self {
         self.append_journal(notarize.view(), Artifact::Notarize(notarize))
             .await
     }
 
     /// Records a notarization certificate and blocks any equivocating leader.
+    #[tracing::instrument(name = "simplex.voter.handle_notarization", target = "lifecycle", level = "debug", skip_all)]
     async fn handle_notarization(mut self, notarization: Notarization<S, D>) -> Self {
+        let lifecycle_digest = notarization.proposal.payload;
         let view = notarization.view();
         let artifact = Artifact::Notarization(notarization.clone());
         let (added, equivocator) = self.state.add_notarization(notarization);
         if added {
+            tracing::info!(target: "lifecycle", stage = "notarized", block_hash = %lifecycle_digest);
             self = self.append_journal(view, artifact).await;
         }
         self.block_equivocator(equivocator);
@@ -520,6 +533,7 @@ impl<
     ///
     /// If certification succeeds, the proposal can be used in future views. If it fails, we
     /// should nullify the view as fast as possible.
+    #[tracing::instrument(name = "simplex.voter.handle_certification", target = "lifecycle", level = "debug", skip_all)]
     async fn handle_certification(
         mut self,
         view: View,
@@ -540,6 +554,7 @@ impl<
     }
 
     /// Persists our finalize vote to the journal for crash recovery.
+    #[tracing::instrument(name = "simplex.voter.handle_finalize", target = "lifecycle", level = "debug", skip_all)]
     async fn handle_finalize(self, finalize: Finalize<S, D>) -> Self {
         self.append_journal(finalize.view(), Artifact::Finalize(finalize))
             .await
@@ -551,11 +566,14 @@ impl<
     /// If a crash loses a finalization that healed the same-term finalize
     /// gate, replay restores the blocked gate (which is safe) and it heals
     /// again as soon as peers redeliver any covering finalization.
+    #[tracing::instrument(name = "simplex.voter.handle_finalization", target = "lifecycle", level = "debug", skip_all)]
     async fn handle_finalization(mut self, finalization: Finalization<S, D>) -> Self {
+        let lifecycle_digest = finalization.proposal.payload;
         let view = finalization.view();
         let artifact = Artifact::Finalization(finalization.clone());
         let (added, equivocator) = self.state.add_finalization(finalization);
         if added {
+            tracing::info!(target: "lifecycle", stage = "finalized", block_hash = %lifecycle_digest);
             self = self.append_journal(view, artifact).await;
         }
         self.block_equivocator(equivocator);
@@ -669,6 +687,7 @@ impl<
     /// Processes the automaton's response to a proposal request.
     ///
     /// Returns the view to notify if the proposal was recorded.
+    #[tracing::instrument(name = "simplex.voter.process_proposed", target = "lifecycle", level = "debug", skip_all)]
     fn process_proposed(
         &mut self,
         context: Context<D, S::PublicKey>,
@@ -719,6 +738,7 @@ impl<
     /// Processes the automaton's response to a verification request.
     ///
     /// Returns the view to notify.
+    #[tracing::instrument(name = "simplex.voter.process_verified", target = "lifecycle", level = "debug", skip_all)]
     fn process_verified(
         &mut self,
         context: Context<D, S::PublicKey>,
@@ -750,6 +770,7 @@ impl<
     /// pruned) and, if the result was recorded, the certification outcome to
     /// stage for [Self::notify].
     #[allow(clippy::type_complexity)]
+    #[tracing::instrument(name = "simplex.voter.process_certified", target = "lifecycle", level = "debug", skip_all)]
     async fn process_certified(
         mut self,
         round: Rnd,

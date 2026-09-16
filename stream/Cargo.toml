@@ -23,6 +23,7 @@ commonware-utils.workspace = true
 futures.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
 

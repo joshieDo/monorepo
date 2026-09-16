@@ -234,6 +234,7 @@ where
     ////////////////////////////////////////
 
     /// Handles a `broadcast` request from the application.
+    #[tracing::instrument(name = "broadcast.handle_broadcast", target = "lifecycle", level = "debug", skip_all)]
     fn handle_broadcast<Sr: Sender<PublicKey = P>>(
         &mut self,
         sender: &mut WrappedSender<Sr, M>,
@@ -252,6 +253,7 @@ where
     ///
     /// If the message is already in the cache, the responder is immediately sent the message.
     /// Otherwise, the responder is stored in the waiters list.
+    #[tracing::instrument(name = "broadcast.handle_subscribe", target = "lifecycle", level = "debug", skip_all)]
     fn handle_subscribe(&mut self, digest: M::Digest, responder: oneshot::Sender<Arc<M>>) {
         // Check if the message is already in the cache
         if let Some(item) = self.items.get(&digest).cloned() {
@@ -267,12 +269,14 @@ where
     }
 
     /// Handles a `get` request from the application.
+    #[tracing::instrument(name = "broadcast.handle_get", target = "lifecycle", level = "debug", skip_all)]
     fn handle_get(&mut self, digest: M::Digest, responder: oneshot::Sender<Option<Arc<M>>>) {
         let item = self.items.get(&digest).cloned();
         self.respond_get(responder, item);
     }
 
     /// Handles a message that was received from a peer.
+    #[tracing::instrument(name = "broadcast.handle_network", target = "lifecycle", level = "debug", skip_all)]
     fn handle_network(&mut self, peer: P, msg: M) {
         let digest = msg.digest();
         match self.insert_message(peer.clone(), digest, msg) {
@@ -324,6 +328,7 @@ where
 
     /// Records a peer's reference to a message, acquiring an `Arc` only when
     /// the cache needs to store the message.
+    #[tracing::instrument(name = "broadcast.insert_cache_entry", target = "lifecycle", level = "debug", skip_all)]
     fn insert_cache_entry(
         &mut self,
         peer: P,
@@ -411,6 +416,7 @@ where
 
     /// Respond to a waiter with a message.
     /// Increments the appropriate metric based on the result.
+    #[tracing::instrument(name = "broadcast.respond_subscribe", target = "lifecycle", level = "debug", skip_all)]
     fn respond_subscribe(&mut self, responder: oneshot::Sender<Arc<M>>, msg: Arc<M>) {
         self.metrics.subscribe.inc(if responder.send_lossy(msg) {
             Status::Success
@@ -419,6 +425,7 @@ where
         });
     }
 
+    #[tracing::instrument(name = "broadcast.respond_waiters", target = "lifecycle", level = "debug", skip_all)]
     fn respond_waiters(&mut self, waiters: Vec<Waiter<M>>, msg: &Arc<M>) {
         for waiter in waiters {
             self.respond_subscribe(waiter.responder, Arc::clone(msg));

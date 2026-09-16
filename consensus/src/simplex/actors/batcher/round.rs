@@ -152,6 +152,7 @@ impl<
     /// Retained votes are forwarded to the verifier for certificate assembly.
     /// Compacted phases preserve duplicate suppression and proposal forwarding
     /// without recreating their released vote maps.
+    #[tracing::instrument(name = "simplex.batcher.round.accept_vote", target = "lifecycle", level = "debug", skip_all)]
     pub(super) fn accept_vote(&mut self, message: Vote<S, D>, constructed: bool) -> Outcome {
         if constructed && let Vote::Finalize(finalize) = &message {
             // The voter only constructs a finalize after independently
@@ -219,6 +220,7 @@ impl<
     }
 
     /// Adds a vote from the network to this round's verifier.
+    #[tracing::instrument(name = "simplex.batcher.round.add_network", target = "lifecycle", level = "debug", skip_all)]
     pub fn add_network(&mut self, sender: S::PublicKey, message: Vote<S, D>) -> bool {
         // Check if sender is a participant
         let Some(index) = self.verifier.participants().index(&sender) else {
@@ -366,6 +368,7 @@ impl<
     ///
     /// Returns the number of votes processed and the signers that failed
     /// verification.
+    #[tracing::instrument(name = "simplex.batcher.round.try_verify", target = "lifecycle", level = "debug", skip_all)]
     pub async fn try_verify<E: CryptoRng>(
         &mut self,
         rng: &mut E,
@@ -416,6 +419,7 @@ impl<
     ///
     /// Once recovery starts, it consumes the verified votes. Do not cancel unless the round will
     /// also be discarded.
+    #[tracing::instrument(name = "simplex.batcher.round.try_construct_certificate", target = "lifecycle", level = "debug", skip_all)]
     pub async fn try_construct_certificate(
         &mut self,
         strategy: &impl Strategy,

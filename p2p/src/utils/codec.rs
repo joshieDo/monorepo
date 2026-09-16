@@ -57,6 +57,7 @@ impl<S: Sender, V: Codec> WrappedSender<S, V> {
     }
 
     /// Send a borrowed message to a set of recipients.
+    #[tracing::instrument(name = "network.codec.send_ref", target = "lifecycle", level = "debug", skip_all)]
     pub fn send_ref(
         &mut self,
         recipients: Recipients<S::PublicKey>,
@@ -100,6 +101,7 @@ impl<'a, S: Sender, V: Codec> CheckedWrappedSender<'a, S, V> {
         self.send_ref(&message, priority)
     }
 
+    #[tracing::instrument(name = "network.codec.send_ref", target = "lifecycle", level = "debug", skip_all)]
     pub fn send_ref(self, message: &V, priority: bool) -> Unreliable<Feedback> {
         let encoded = message.encode_with_pool(self.pool);
         self.sender.send(encoded, priority)
@@ -119,6 +121,7 @@ impl<R: Receiver, V: Codec> WrappedReceiver<R, V> {
     }
 
     /// Receive a message from an arbitrary recipient.
+    #[tracing::instrument(name = "network.codec.recv", target = "lifecycle", level = "debug", skip_all)]
     pub async fn recv(&mut self) -> Result<WrappedMessage<R::PublicKey, V>, R::Error> {
         let (pk, bytes) = self.receiver.recv().await?;
         let decoded = match V::decode_cfg(bytes.as_ref(), &self.config) {
@@ -158,6 +161,7 @@ pub struct BackgroundReceiver<P: PublicKey, V> {
 
 impl<P: PublicKey, V> BackgroundReceiver<P, V> {
     /// Receive the next successfully decoded message.
+    #[tracing::instrument(name = "network.codec.recv", target = "lifecycle", level = "debug", skip_all)]
     pub async fn recv(&mut self) -> Option<(P, V)> {
         self.receiver
             .recv()
@@ -368,6 +372,7 @@ mod tests {
         type Error = io::Error;
         type PublicKey = P;
 
+        #[tracing::instrument(name = "network.codec.recv", target = "lifecycle", level = "debug", skip_all)]
         async fn recv(&mut self) -> Result<crate::Message<Self::PublicKey>, Self::Error> {
             self.receiver
                 .recv()
@@ -386,6 +391,7 @@ mod tests {
         type Error = io::Error;
         type PublicKey = P;
 
+        #[tracing::instrument(name = "network.codec.recv", target = "lifecycle", level = "debug", skip_all)]
         async fn recv(&mut self) -> Result<crate::Message<Self::PublicKey>, Self::Error> {
             self.received.fetch_add(1, Ordering::SeqCst);
             self.receiver

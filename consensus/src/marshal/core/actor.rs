@@ -597,6 +597,7 @@ where
     }
 
     /// Handles a single mailbox message from local consensus/application callers.
+    #[tracing::instrument(name = "marshal.handle_mailbox_message", target = "lifecycle", level = "debug", skip_all)]
     async fn handle_mailbox_message<Buf, R>(
         mut self: Box<Self>,
         message: Message<P::Scheme, V>,
@@ -1078,6 +1079,7 @@ where
 
     /// Handle a local subscription request for a block.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "marshal.handle_subscribe", target = "lifecycle", level = "debug", skip_all)]
     async fn handle_subscribe<Buf: Buffer<V>>(
         &mut self,
         span: Span,
@@ -1229,6 +1231,7 @@ where
     /// is a no-op because the round is below the retention floor (and no longer
     /// is required by consensus to make progress). A duplicate delivery is also
     /// a no-op, with the handle still covering the original write's durability.
+    #[tracing::instrument(name = "marshal.persist_verified", target = "lifecycle", level = "debug", skip_all)]
     async fn persist_verified<Buf: Buffer<V>>(
         mut self: Box<Self>,
         round: Round,
@@ -1264,6 +1267,7 @@ where
     /// [`Self::try_dispatch_blocks`]).
     ///
     /// Returns true if the block was consumed as the floor anchor.
+    #[tracing::instrument(name = "marshal.ingest", target = "lifecycle", level = "debug", skip_all)]
     async fn ingest<Buf: Buffer<V>>(
         mut self: Box<Self>,
         block: Arc<V::Block>,
@@ -1419,6 +1423,7 @@ where
     /// Handle a deliver message from the resolver. Block delivers are handled
     /// immediately. Finalized/Notarized delivers are parsed and structurally
     /// validated, then collected into `delivers` for batch certificate verification.
+    #[tracing::instrument(name = "marshal.handle_deliver", target = "lifecycle", level = "debug", skip_all)]
     async fn handle_deliver<Buf: Buffer<V>>(
         mut self: Box<Self>,
         message: ResolverDelivery<V>,
@@ -1634,6 +1639,7 @@ where
 
     /// Batch verify pending certificates and process valid items.
     #[tracing::instrument(name = "marshal.actor.verify_delivered", level = "info", skip_all, fields(count = delivers.len().traced()))]
+    #[tracing::instrument(name = "marshal.verify_delivered", target = "lifecycle", level = "debug", skip_all)]
     async fn verify_delivered<Buf: Buffer<V>>(
         mut self: Box<Self>,
         mut delivers: Vec<PendingVerification<P::Scheme, V>>,
@@ -1861,6 +1867,7 @@ where
     ///   ack handler       ->  update_processed_height  ->  metadata buffered
     ///   stream.sync       ->  metadata durable
     /// ```
+    #[tracing::instrument(name = "marshal.try_dispatch_blocks", target = "lifecycle", level = "debug", skip_all)]
     async fn try_dispatch_blocks(
         mut self: Box<Self>,
         application: &mut impl Reporter<Activity = Update<V::ApplicationBlock, A>>,
@@ -1918,6 +1925,7 @@ where
     /// Prefer [`Self::start_finalized_sync`] unless work later in the same
     /// arm requires the writes to already be durable.
     #[tracing::instrument(name = "marshal.actor.sync_finalized", level = "info", skip_all)]
+    #[tracing::instrument(name = "marshal.sync_finalized", target = "lifecycle", level = "debug", skip_all)]
     async fn sync_finalized(mut self: Box<Self>) -> Box<Self> {
         (self.finalized_blocks, self.finalizations_by_height) = try_join!(
             self.finalized_blocks.sync().map_err(BoxedError::from),
@@ -1949,6 +1957,7 @@ where
     /// `select_loop!` arm as the writes it covers, before yielding back to the
     /// loop. `round` only labels the sync in diagnostics.
     #[tracing::instrument(name = "marshal.actor.start_finalized_sync", level = "info", skip_all)]
+    #[tracing::instrument(name = "marshal.start_finalized_sync", target = "lifecycle", level = "debug", skip_all)]
     async fn start_finalized_sync(
         mut self: Box<Self>,
         round: Round,
@@ -2144,6 +2153,7 @@ where
     // -------------------- Mixed Storage --------------------
 
     /// Looks for a block in cache and finalized storage by digest.
+    #[tracing::instrument(name = "marshal.find_block_in_storage", target = "lifecycle", level = "debug", skip_all)]
     async fn find_block_in_storage(
         &self,
         digest: <V::Block as Digestible>::Digest,
@@ -2160,6 +2170,7 @@ where
     }
 
     /// Looks for a block in cache and finalized storage by full consensus commitment.
+    #[tracing::instrument(name = "marshal.find_block_in_storage_by_commitment", target = "lifecycle", level = "debug", skip_all)]
     async fn find_block_in_storage_by_commitment(
         &self,
         commitment: V::Commitment,
@@ -2186,6 +2197,7 @@ where
     ///
     /// This is used when we only have a digest (during gap repair following
     /// parent links).
+    #[tracing::instrument(name = "marshal.find_block_by_digest", target = "lifecycle", level = "debug", skip_all)]
     async fn find_block_by_digest<Buf: Buffer<V>>(
         &self,
         buffer: &Buf,
@@ -2201,6 +2213,7 @@ where
     ///
     /// This is used when we have a full commitment (from notarizations/finalizations).
     /// Having the full commitment may enable additional retrieval mechanisms.
+    #[tracing::instrument(name = "marshal.find_block_by_commitment", target = "lifecycle", level = "debug", skip_all)]
     async fn find_block_by_commitment<Buf: Buffer<V>>(
         &self,
         buffer: &Buf,

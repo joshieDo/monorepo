@@ -263,6 +263,7 @@ where
     }
 
     /// Forwards a proposal to the requested peers.
+    #[tracing::instrument(name = "simplex.batcher.forward_proposal", target = "lifecycle", level = "debug", skip_all)]
     fn forward_proposal(&mut self, proposal: Proposal<D>, missing: Vec<Participant>) {
         let peers = self.forward_recipients(&missing);
         if peers.is_empty() {
@@ -317,6 +318,7 @@ where
 
     /// Batch-verifies any ready votes for `view` and forwards newly
     /// constructible certificates to the voter.
+    #[tracing::instrument(name = "simplex.batcher.process_view", target = "lifecycle", level = "debug", skip_all)]
     async fn process_view(
         &mut self,
         voter: &mut voter::Mailbox<S, D>,

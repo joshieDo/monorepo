@@ -58,7 +58,7 @@
 use crate::utils::codec::{append_frame, framed_len, recv_frame, send_frame};
 use commonware_codec::{DecodeExt, Encode as _, Error as CodecError, FixedSize};
 use commonware_cryptography::{
-    Signer,
+    Hasher as _, Signer,
     handshake::{
         self, Ack, Context, Error as HandshakeError, RecvCipher, SendCipher, Syn, SynAck, dial_end,
         dial_start, listen_end, listen_start,
@@ -342,6 +342,7 @@ impl<O: Sink> Sender<O> {
     /// This lets chunk builders append multiple independently framed
     /// ciphertexts into a single contiguous allocation without staging each
     /// frame in its own buffer first.
+    #[tracing::instrument(name = "network.encrypted.append_encrypted_frame", target = "lifecycle", level = "debug", skip_all)]
     fn append_encrypted_frame(
         &mut self,
         chunk: &mut IoBufMut,
@@ -360,6 +361,10 @@ impl<O: Sink> Sender<O> {
                     .cipher
                     .send_in_place(&mut chunk.as_mut()[plaintext_offset..])?;
                 chunk.put_slice(&tag);
+                if tracing::enabled!(target: "lifecycle", tracing::Level::INFO) {
+                    let frame_hash = commonware_cryptography::sha256::Sha256::hash(&[&tag]);
+                    tracing::info!(target: "lifecycle", stage = "frame_send", %frame_hash, bytes = (chunk.len() - plaintext_offset) as u64);
+                }
                 Ok(())
             },
         )?;
@@ -370,6 +375,7 @@ impl<O: Sink> Sender<O> {
     ///
     /// Callers compute `total_len` up front so this helper can allocate once,
     /// append each framed ciphertext in order, and freeze the result.
+    #[tracing::instrument(name = "network.encrypted.build_chunk", target = "lifecycle", level = "debug", skip_all)]
     fn build_chunk<I>(&mut self, messages: I, total_len: usize) -> Result<IoBuf, Error>
     where
         I: IntoIterator<Item = IoBufs>,
@@ -386,6 +392,7 @@ impl<O: Sink> Sender<O> {
     ///
     /// This validation pass ensures any oversize error is reported before
     /// encryption advances nonces, so the sender remains usable after failure.
+    #[tracing::instrument(name = "network.encrypted.plan_chunks", target = "lifecycle", level = "debug", skip_all)]
     fn plan_chunks<B, I>(&self, bufs: I) -> Result<Vec<ChunkPlan>, Error>
     where
         B: Into<IoBufs>,
@@ -447,6 +454,7 @@ impl<O: Sink> Sender<O> {
     ///
     /// Allocates a buffer from the pool, copies plaintext, encrypts in-place,
     /// and sends the ciphertext.
+    #[tracing::instrument(name = "network.encrypted.send", target = "lifecycle", level = "debug", skip_all)]
     pub async fn send(&mut self, bufs: impl Into<IoBufs>) -> Result<(), Error> {
         let bufs = bufs.into();
         let frame_len = self.encrypted_frame_len(bufs.len())?;
@@ -461,6 +469,7 @@ impl<O: Sink> Sender<O> {
     /// chunks capped to one network buffer-pool item, then submitted together as
     /// a chunked `IoBufs`. An individual message larger than that cap is still
     /// sent as its own chunk.
+    #[tracing::instrument(name = "network.encrypted.send_many", target = "lifecycle", level = "debug", skip_all)]
     pub async fn send_many<B, I>(&mut self, bufs: I) -> Result<(), Error>
     where
         B: Into<IoBufs>,
@@ -497,6 +506,7 @@ impl<I: Stream> Receiver<I> {
     /// Receives ciphertext and decrypts it in-place when the received frame is
     /// a single, uniquely-owned buffer. Otherwise, allocates a buffer from the
     /// pool, copies the ciphertext, and decrypts the copy in-place.
+    #[tracing::instrument(name = "network.encrypted.recv", target = "lifecycle", level = "debug", skip_all)]
     pub async fn recv(&mut self) -> Result<IoBufs, Error> {
         let encrypted = recv_frame(
             &mut self.stream,
@@ -519,6 +529,12 @@ impl<I: Stream> Receiver<I> {
             }
         };
 
+        if tracing::enabled!(target: "lifecycle", tracing::Level::INFO) && decryption_buf.len() >= TAG_SIZE as usize {
+            let tag = &decryption_buf.as_ref()[decryption_buf.len() - TAG_SIZE as usize..];
+            let frame_hash = commonware_cryptography::sha256::Sha256::hash(&[tag]);
+            tracing::info!(target: "lifecycle", stage = "frame_receive", %frame_hash, bytes = decryption_buf.len() as u64);
+        }
+        let _decrypt = tracing::debug_span!(target: "lifecycle", "network.decrypt").entered();
         // Decrypt in-place, get plaintext length back.
         let plaintext_len = self.cipher.recv_in_place(decryption_buf.as_mut())?;
 
@@ -588,6 +604,7 @@ mod test {
     }
 
     impl<S: commonware_runtime::Sink> commonware_runtime::Sink for CountingSink<S> {
+        #[tracing::instrument(name = "network.encrypted.send", target = "lifecycle", level = "debug", skip_all)]
         async fn send(&mut self, bufs: impl Into<IoBufs> + Send) -> Result<(), RuntimeError> {
             let bufs = bufs.into();
             self.sends.fetch_add(1, Ordering::Relaxed);
@@ -608,6 +625,7 @@ mod test {
     }
 
     impl<S: commonware_runtime::Stream> commonware_runtime::Stream for PoolingStream<S> {
+        #[tracing::instrument(name = "network.encrypted.recv", target = "lifecycle", level = "debug", skip_all)]
         async fn recv(&mut self, len: usize) -> Result<IoBufs, RuntimeError> {
             let mut bufs = self.inner.recv(len).await?;
             let mut buf = self.pool.alloc(len);
