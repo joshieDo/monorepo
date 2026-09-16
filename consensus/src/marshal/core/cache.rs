@@ -327,15 +327,18 @@ where
     /// drop the new block while the returned handle vouches only for the old
     /// one. A digest already stored at this view is not duplicated, and the
     /// covering handle reports the durability of its existing write.
+    ///
+    /// The boolean reports a newly stored candidate, excluding duplicates and
+    /// pruned-round no-ops. It does not imply durability or application validity.
     pub(crate) async fn put_verified(
         mut self,
         round: Round,
         digest: <V::Block as Digestible>::Digest,
         block: V::StoredBlock,
-    ) -> (Self, Handle<()>) {
+    ) -> (Self, Handle<()>, bool) {
         let view = round.view().get();
-        let handle;
-        (self, handle) = self
+        let result;
+        (self, result) = self
             .with_epoch(round.epoch(), |mut cache| async move {
                 // Deduplicate against this view only: the same digest may legitimately
                 // be stored again at a later view (boundary re-proposal), and each view
@@ -359,10 +362,19 @@ where
                     (cache.verified_blocks, handle) =
                         Self::handle_start_result(result, round, "verified");
                 }
-                (cache, handle)
+                // Writes below the archive's pruned view floor succeed as no-ops.
+                // Only a newly stored candidate may seed the decoded cache.
+                let inserted = !exists
+                    && cache
+                        .verified_blocks
+                        .has_at(view, &digest)
+                        .await
+                        .unwrap_or_else(|e| panic!("failed to check verified insertion: {e}"));
+                (cache, (handle, inserted))
             })
             .await;
-        (self, handle.unwrap_or_else(|| Handle::ready(Ok(()))))
+        let (handle, inserted) = result.unwrap_or_else(|| (Handle::ready(Ok(())), false));
+        (self, handle, inserted)
     }
 
     /// Add a certified block to the height-indexed archive.

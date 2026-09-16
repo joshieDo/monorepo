@@ -10,8 +10,8 @@ struct Entry<C, D, B> {
     finalized: bool,
 }
 
-/// FIFO cache for successfully decoded archive reads. Full commitments are
-/// compared on commitment lookups, including variant-specific fields.
+/// FIFO cache for decoded archive reads and newly stored validated candidates.
+/// Full commitments are compared, including variant-specific fields.
 ///
 /// Encoded bytes are a retention weight, not a measurement of allocated heap.
 /// Both the number of blocks and their total encoded size are bounded. Blocks

@@ -1267,11 +1267,16 @@ where
             .ingest(Arc::clone(&block), buffer, application, resolver)
             .await;
         let digest = block.digest();
-        let handle;
-        (self.cache, handle) = self
+        let decoded = Arc::clone(&block);
+        let (handle, inserted);
+        (self.cache, handle, inserted) = self
             .cache
             .put_verified(round, digest, Arc::unwrap_or_clone(block).into())
             .await;
+        if inserted {
+            // Archive acceptance does not grant finalized-height provenance.
+            self.remember_decoded(decoded, false);
+        }
         ack.send_lossy(handle);
         self
     }
@@ -2276,8 +2281,8 @@ where
         Some(block)
     }
 
-    /// Retain only successfully decoded archive reads. Cache presence says nothing
-    /// about application validity, certificates, or durability.
+    /// Retain decoded archive reads or structurally validated, newly stored
+    /// candidates. Presence says nothing about application validity or durability.
     fn remember_decoded(&self, block: Arc<V::Block>, finalized: bool) {
         let commitment = V::commitment(&block);
         let digest = block.digest();

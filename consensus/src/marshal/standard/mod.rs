@@ -1338,6 +1338,61 @@ mod tests {
         });
     }
 
+    #[test_traced("WARN")]
+    fn test_cache_verified_insertion_excludes_duplicates_and_pruned_rounds() {
+        let executor = deterministic::Runner::timed(Duration::from_secs(10));
+        executor.start(|context| async move {
+            let cfg = cache::Config {
+                partition_prefix: "test-verified-insertion".to_string(),
+                prunable_items_per_section: NZU64!(1),
+                replay_buffer: NonZeroUsize::new(1024).unwrap(),
+                key_write_buffer: NonZeroUsize::new(1024).unwrap(),
+                value_write_buffer: NonZeroUsize::new(1024).unwrap(),
+                key_page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
+            };
+            let mut mgr = cache::Manager::<_, Standard<B>, S>::init(context, cfg, ()).await;
+            let round = Round::new(Epoch::zero(), View::new(1));
+            let block = make_raw_block(Sha256::hash(&[b"first"]), Height::new(1), 100);
+            let other = make_raw_block(Sha256::hash(&[b"other"]), Height::new(1), 100);
+            let late = make_raw_block(Sha256::hash(&[b"late"]), Height::new(1), 100);
+
+            for (candidate, expected) in [(&block, true), (&block, false), (&other, true)] {
+                let (next, handle, inserted) = mgr
+                    .put_verified(round, candidate.digest(), candidate.clone())
+                    .await;
+                mgr = next;
+                assert_eq!(inserted, expected);
+                handle.await.expect("failed to sync candidate");
+                assert!(mgr.has_verified(round, &candidate.digest()).await);
+            }
+
+            // Same-view equivocations remain separate retrievable candidates.
+            for candidate in [&block, &other] {
+                assert_eq!(
+                    mgr.find_block_matching(candidate.digest(), |_| true).await,
+                    Some(candidate.clone())
+                );
+            }
+            for floor in [
+                Round::new(Epoch::zero(), View::new(2)),
+                Round::new(Epoch::new(1), View::zero()),
+            ] {
+                mgr = mgr.prune_by_view(floor).await;
+                let (next, handle, inserted) =
+                    mgr.put_verified(round, late.digest(), late.clone()).await;
+                mgr = next;
+                assert!(
+                    !inserted,
+                    "pruned view or epoch must not seed decoded blocks"
+                );
+                handle
+                    .await
+                    .expect("pruned insertion must preserve its ready handle");
+                assert!(!mgr.has_verified(round, &late.digest()).await);
+            }
+        });
+    }
+
     // The certify barrier folds in notarization durability via
     // `start_sync_notarizations`: the handle it returns covers a notarization
     // write accepted earlier (whose own handle was dropped unawaited), so
@@ -8805,7 +8860,7 @@ mod tests {
             } = bls12381_threshold_vrf::fixture::<V, _>(&mut context, NAMESPACE, NUM_VALIDATORS);
             let me = participants[0].clone();
             let round = Round::new(Epoch::zero(), View::new(1));
-            let block = make_raw_block(Sha256::hash(&[b""]), Height::new(1), 100);
+            let block = Arc::new(make_raw_block(Sha256::hash(&[b""]), Height::new(1), 100));
             let digest = block.digest();
 
             let (mailbox, buffer, _resolver, _actor_handle) = start_standard_actor(
@@ -8833,6 +8888,17 @@ mod tests {
             let (sent_round, sent_block, sent_recipients) = &sends[0];
             assert_eq!(*sent_round, round);
             assert_eq!(sent_block.digest(), digest);
+            assert!(
+                Arc::ptr_eq(sent_block, &block),
+                "forward must reuse the verified allocation"
+            );
+            assert!(
+                mailbox
+                    .get_block(Identifier::Height(Height::new(1)))
+                    .await
+                    .is_none(),
+                "verified cache presence must not imply finalized-height provenance"
+            );
             match sent_recipients {
                 Recipients::Some(peers) => assert_eq!(peers, &targets),
                 other => panic!("expected Recipients::Some, got {other:?}"),
