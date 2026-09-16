@@ -25,7 +25,7 @@ pub enum Error {
     NetworkClosed,
 }
 
-pub(crate) struct Inbound<P: PublicKey>(pub(crate) NetworkMessage<P>);
+pub(crate) struct Inbound<P: PublicKey>(pub(crate) NetworkMessage<P>, pub(crate) Option<u64>);
 
 impl<P: PublicKey> UnreliablePolicy for Inbound<P> {
     type Overflow = VecDeque<Self>;
@@ -151,11 +151,21 @@ impl<P: PublicKey> crate::Receiver for Receiver<P> {
     /// This method will block until a message is received or the underlying
     /// network shuts down.
     async fn recv(&mut self) -> Result<NetworkMessage<Self::PublicKey>, Error> {
-        let Inbound((sender, message)) = self.receiver.recv().await.ok_or(Error::NetworkClosed)?;
+        self.recv_with_context().await.map(|(message, _)| message)
+    }
+
+    async fn recv_with_context(
+        &mut self,
+    ) -> Result<(NetworkMessage<Self::PublicKey>, Option<u64>), Error> {
+        let Inbound((sender, message), receive_id) =
+            self.receiver.recv().await.ok_or(Error::NetworkClosed)?;
+        if let Some(receive_id) = receive_id {
+            tracing::info!(target: "lifecycle", stage = "message_dequeued", receive_id);
+        }
 
         // We don't check that the message is too large here because we already enforce
         // that on the network layer.
-        Ok((sender, message))
+        Ok(((sender, message), receive_id))
     }
 }
 
@@ -261,12 +271,12 @@ mod tests {
             for _ in 0..4 {
                 assert!(
                     inbound
-                        .enqueue(Inbound((peer.clone(), IoBuf::from(b"message"))))
+                        .enqueue(Inbound((peer.clone(), IoBuf::from(b"message")), None))
                         .accepted()
                 );
             }
             assert_eq!(
-                inbound.enqueue(Inbound((peer, IoBuf::from(b"overflow")))),
+                inbound.enqueue(Inbound((peer, IoBuf::from(b"overflow")), None)),
                 Unreliable::Rejected
             );
 
@@ -311,6 +321,43 @@ mod tests {
             let mut channels =
                 Channels::<PublicKey>::new(messenger, 1024, NonZeroUsize::new(usize::MAX).unwrap());
             let _ = channels.register(0, rate, context);
+        });
+    }
+    #[test]
+    fn inbound_lineage_survives_queue_and_rejection() {
+        deterministic::Runner::default().start(|context| async move {
+            let messenger = Messenger::unbound(context.network_buffer_pool().clone());
+            let mut channels = Channels::new(messenger, 1024, NZUsize!(1));
+            let (_, mut receiver) =
+                channels.register(1, Quota::per_second(NZU32!(1)), context.child("channel"));
+            let inbound = channels.receivers.get(&1).unwrap().1.clone();
+            let peer = PrivateKey::from_seed(1).public_key();
+            assert!(
+                inbound
+                    .enqueue(Inbound((peer.clone(), IoBuf::from(b"accepted")), Some(7)))
+                    .accepted()
+            );
+            assert!(
+                !inbound
+                    .enqueue(Inbound((peer.clone(), IoBuf::from(b"rejected")), Some(8)))
+                    .accepted()
+            );
+            let ((sender, bytes), id) = crate::Receiver::recv_with_context(&mut receiver)
+                .await
+                .unwrap();
+            assert_eq!(
+                (sender, bytes, id),
+                (peer.clone(), IoBuf::from(b"accepted"), Some(7))
+            );
+            assert!(
+                inbound
+                    .enqueue(Inbound((peer, IoBuf::from(b"legacy")), Some(9)))
+                    .accepted()
+            );
+            assert_eq!(
+                crate::Receiver::recv(&mut receiver).await.unwrap().1,
+                IoBuf::from(b"legacy")
+            );
         });
     }
 }

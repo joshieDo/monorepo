@@ -183,6 +183,9 @@ stability_scope!(BETA {
     // Blanket implementation of `Sender` for all `LimitedSender`s.
     impl<S: LimitedSender> Sender for S {}
 
+    /// A network message and optional process-local frame tracing ordinal.
+    pub type MessageWithContext<P> = (Message<P>, Option<u64>);
+
     /// Interface for receiving messages from arbitrary recipients.
     pub trait Receiver: Debug + Send + 'static {
         /// Error that can occur when receiving a message.
@@ -195,6 +198,16 @@ stability_scope!(BETA {
         fn recv(
             &mut self,
         ) -> impl Future<Output = Result<Message<Self::PublicKey>, Self::Error>> + Send;
+
+        /// Receives a message with optional process-local frame tracing context.
+        ///
+        /// Context is not protocol data and carries no peer identity. Transports
+        /// without frame attribution use the default implementation and return none.
+        fn recv_with_context(
+            &mut self,
+        ) -> impl Future<Output = Result<MessageWithContext<Self::PublicKey>, Self::Error>> + Send {
+            async { self.recv().await.map(|message| (message, None)) }
+        }
     }
 
     /// Notification sent to subscribers when a peer set changes.

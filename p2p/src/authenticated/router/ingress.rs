@@ -212,11 +212,16 @@ impl<P: PublicKey> Messenger<P> {
         // Encode the data frame once for all recipients
         let encoded = EncodedData::new(&self.pool, channel, message);
 
-        mailbox.0.enqueue(Message::Content {
+        let message_id = encoded.message_id;
+        let feedback = mailbox.0.enqueue(Message::Content {
             recipients,
             encoded,
             priority,
-        })
+        });
+        if let Some(message_id) = message_id {
+            tracing::info!(target: "lifecycle", stage = "message_router_queue", message_id, accepted = u64::from(feedback.accepted()));
+        }
+        feedback
     }
 }
 

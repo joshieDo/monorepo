@@ -72,7 +72,12 @@ use commonware_runtime::{
 };
 use commonware_utils::SystemTimeExt;
 use rand_core::CryptoRng;
-use std::{future::Future, ops::Range, time::Duration};
+use std::{
+    future::Future,
+    ops::Range,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use thiserror::Error;
 
 const TAG_SIZE: u32 = {
@@ -320,9 +325,12 @@ pub struct Sender<O> {
     pool: BufferPool,
 }
 
+/// Bytes and an optional process-local tracing ordinal, never encoded on the wire.
+pub type MessageWithContext = (IoBufs, Option<u64>);
+
 /// Describes one contiguous sink chunk made up of one or more encrypted frames.
 struct ChunkPlan {
-    messages: Vec<IoBufs>,
+    messages: Vec<MessageWithContext>,
     total_len: usize,
 }
 
@@ -342,11 +350,17 @@ impl<O: Sink> Sender<O> {
     /// This lets chunk builders append multiple independently framed
     /// ciphertexts into a single contiguous allocation without staging each
     /// frame in its own buffer first.
-    #[tracing::instrument(name = "network.encrypted.append_encrypted_frame", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.encrypted.append_encrypted_frame",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn append_encrypted_frame(
         &mut self,
         chunk: &mut IoBufMut,
         mut bufs: IoBufs,
+        message_id: Option<u64>,
     ) -> Result<(), Error> {
         append_frame(
             chunk,
@@ -363,7 +377,7 @@ impl<O: Sink> Sender<O> {
                 chunk.put_slice(&tag);
                 if tracing::enabled!(target: "lifecycle", tracing::Level::INFO) {
                     let frame_hash = commonware_cryptography::sha256::Sha256::hash(&[&tag]);
-                    tracing::info!(target: "lifecycle", stage = "frame_send", %frame_hash, bytes = (chunk.len() - plaintext_offset) as u64);
+                    tracing::info!(target: "lifecycle", stage = "frame_send", %frame_hash, message_id = message_id.unwrap_or(0), bytes = (chunk.len() - plaintext_offset) as u64);
                 }
                 Ok(())
             },
@@ -375,14 +389,19 @@ impl<O: Sink> Sender<O> {
     ///
     /// Callers compute `total_len` up front so this helper can allocate once,
     /// append each framed ciphertext in order, and freeze the result.
-    #[tracing::instrument(name = "network.encrypted.build_chunk", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.encrypted.build_chunk",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn build_chunk<I>(&mut self, messages: I, total_len: usize) -> Result<IoBuf, Error>
     where
-        I: IntoIterator<Item = IoBufs>,
+        I: IntoIterator<Item = MessageWithContext>,
     {
         let mut chunk = self.pool.alloc(total_len);
-        for msg in messages {
-            self.append_encrypted_frame(&mut chunk, msg)?;
+        for (msg, message_id) in messages {
+            self.append_encrypted_frame(&mut chunk, msg, message_id)?;
         }
         assert_eq!(chunk.len(), total_len);
         Ok(chunk.freeze())
@@ -392,11 +411,15 @@ impl<O: Sink> Sender<O> {
     ///
     /// This validation pass ensures any oversize error is reported before
     /// encryption advances nonces, so the sender remains usable after failure.
-    #[tracing::instrument(name = "network.encrypted.plan_chunks", target = "lifecycle", level = "debug", skip_all)]
-    fn plan_chunks<B, I>(&self, bufs: I) -> Result<Vec<ChunkPlan>, Error>
+    #[tracing::instrument(
+        name = "network.encrypted.plan_chunks",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
+    fn plan_chunks<I>(&self, bufs: I) -> Result<Vec<ChunkPlan>, Error>
     where
-        B: Into<IoBufs>,
-        I: IntoIterator<Item = B>,
+        I: IntoIterator<Item = MessageWithContext>,
     {
         let bufs = bufs.into_iter();
         let (lower, _) = bufs.size_hint();
@@ -405,9 +428,8 @@ impl<O: Sink> Sender<O> {
         let mut batch_total = 0usize;
         let max_batch_size = self.pool.config().max_size().get();
 
-        for buf in bufs {
-            let msg = buf.into();
-            let frame_len = self.encrypted_frame_len(msg.len())?;
+        for msg in bufs {
+            let frame_len = self.encrypted_frame_len(msg.0.len())?;
 
             // If one framed message is larger than the pooled batch cap, keep
             // current chunks intact and send that message as its own chunk.
@@ -454,11 +476,16 @@ impl<O: Sink> Sender<O> {
     ///
     /// Allocates a buffer from the pool, copies plaintext, encrypts in-place,
     /// and sends the ciphertext.
-    #[tracing::instrument(name = "network.encrypted.send", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "network.encrypted.send",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     pub async fn send(&mut self, bufs: impl Into<IoBufs>) -> Result<(), Error> {
         let bufs = bufs.into();
         let frame_len = self.encrypted_frame_len(bufs.len())?;
-        let chunk = self.build_chunk(std::iter::once(bufs), frame_len)?;
+        let chunk = self.build_chunk(std::iter::once((bufs, None)), frame_len)?;
         self.sink.send(chunk).await.map_err(Error::SendFailed)
     }
 
@@ -469,11 +496,28 @@ impl<O: Sink> Sender<O> {
     /// chunks capped to one network buffer-pool item, then submitted together as
     /// a chunked `IoBufs`. An individual message larger than that cap is still
     /// sent as its own chunk.
-    #[tracing::instrument(name = "network.encrypted.send_many", target = "lifecycle", level = "debug", skip_all)]
     pub async fn send_many<B, I>(&mut self, bufs: I) -> Result<(), Error>
     where
         B: Into<IoBufs>,
         I: IntoIterator<Item = B>,
+    {
+        self.send_many_with_context(bufs.into_iter().map(|buf| (buf.into(), None)))
+            .await
+    }
+
+    /// Sends messages with optional process-local tracing ordinals.
+    ///
+    /// Context is recorded beside each encrypted frame and never enters the wire format.
+    /// It does not establish delivery; a subsequent sink write can fail or be cancelled.
+    #[tracing::instrument(
+        name = "network.encrypted.send_many",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
+    pub async fn send_many_with_context<I>(&mut self, bufs: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = MessageWithContext>,
     {
         let plans = self.plan_chunks(bufs)?;
         if plans.is_empty() {
@@ -506,8 +550,21 @@ impl<I: Stream> Receiver<I> {
     /// Receives ciphertext and decrypts it in-place when the received frame is
     /// a single, uniquely-owned buffer. Otherwise, allocates a buffer from the
     /// pool, copies the ciphertext, and decrypts the copy in-place.
-    #[tracing::instrument(name = "network.encrypted.recv", target = "lifecycle", level = "debug", skip_all)]
     pub async fn recv(&mut self) -> Result<IoBufs, Error> {
+        self.recv_with_context().await.map(|(bytes, _)| bytes)
+    }
+
+    /// Receives authenticated bytes and an optional process-local frame ordinal.
+    ///
+    /// The ordinal is available only when lifecycle tracing is enabled and never
+    /// enters the wire format. Failed authentication does not return a context.
+    #[tracing::instrument(
+        name = "network.encrypted.recv",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
+    pub async fn recv_with_context(&mut self) -> Result<MessageWithContext, Error> {
         let encrypted = recv_frame(
             &mut self.stream,
             self.max_message_size.saturating_add(TAG_SIZE),
@@ -529,10 +586,20 @@ impl<I: Stream> Receiver<I> {
             }
         };
 
-        if tracing::enabled!(target: "lifecycle", tracing::Level::INFO) && decryption_buf.len() >= TAG_SIZE as usize {
+        static NEXT_RECEIVE: AtomicU64 = AtomicU64::new(1);
+        let receive_id = if tracing::enabled!(target: "lifecycle", tracing::Level::INFO) {
+            NEXT_RECEIVE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .ok()
+        } else {
+            None
+        };
+        if tracing::enabled!(target: "lifecycle", tracing::Level::INFO)
+            && decryption_buf.len() >= TAG_SIZE as usize
+        {
             let tag = &decryption_buf.as_ref()[decryption_buf.len() - TAG_SIZE as usize..];
             let frame_hash = commonware_cryptography::sha256::Sha256::hash(&[tag]);
-            tracing::info!(target: "lifecycle", stage = "frame_receive", %frame_hash, bytes = decryption_buf.len() as u64);
+            tracing::info!(target: "lifecycle", stage = "frame_receive", %frame_hash, receive_id = receive_id.unwrap_or(0), bytes = decryption_buf.len() as u64);
         }
         let _decrypt = tracing::debug_span!(target: "lifecycle", "network.decrypt").entered();
         // Decrypt in-place, get plaintext length back.
@@ -541,7 +608,10 @@ impl<I: Stream> Receiver<I> {
         // Truncate to remove tag bytes, keeping only plaintext.
         decryption_buf.truncate(plaintext_len);
 
-        Ok(decryption_buf.freeze().into())
+        if let Some(receive_id) = receive_id {
+            tracing::info!(target: "lifecycle", stage = "frame_authenticated", receive_id);
+        }
+        Ok((decryption_buf.freeze().into(), receive_id))
     }
 }
 
@@ -604,7 +674,12 @@ mod test {
     }
 
     impl<S: commonware_runtime::Sink> commonware_runtime::Sink for CountingSink<S> {
-        #[tracing::instrument(name = "network.encrypted.send", target = "lifecycle", level = "debug", skip_all)]
+        #[tracing::instrument(
+            name = "network.encrypted.send",
+            target = "lifecycle",
+            level = "debug",
+            skip_all
+        )]
         async fn send(&mut self, bufs: impl Into<IoBufs> + Send) -> Result<(), RuntimeError> {
             let bufs = bufs.into();
             self.sends.fetch_add(1, Ordering::Relaxed);
@@ -625,7 +700,6 @@ mod test {
     }
 
     impl<S: commonware_runtime::Stream> commonware_runtime::Stream for PoolingStream<S> {
-        #[tracing::instrument(name = "network.encrypted.recv", target = "lifecycle", level = "debug", skip_all)]
         async fn recv(&mut self, len: usize) -> Result<IoBufs, RuntimeError> {
             let mut bufs = self.inner.recv(len).await?;
             let mut buf = self.pool.alloc(len);
@@ -1125,5 +1199,246 @@ mod test {
                     if n == syn_ack.encode().len() + 1
             ));
         });
+    }
+    #[derive(Clone, Default)]
+    struct LineageCapture(Arc<Mutex<Vec<std::collections::BTreeMap<String, String>>>>);
+
+    impl tracing::Subscriber for LineageCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "lifecycle"
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            tracing::span::Id::from_u64(NEXT.fetch_add(1, Ordering::Relaxed))
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            #[derive(Default)]
+            struct Fields(std::collections::BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.insert(field.name().into(), format!("{value:?}"));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().into(), value.into());
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.0.insert(field.name().into(), value.to_string());
+                }
+            }
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().push(fields.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    struct WireSink<S> {
+        inner: S,
+        wire: Arc<Mutex<Vec<u8>>>,
+        mode: Arc<AtomicUsize>,
+    }
+    impl<S: commonware_runtime::Sink> commonware_runtime::Sink for WireSink<S> {
+        async fn send(&mut self, bufs: impl Into<IoBufs> + Send) -> Result<(), RuntimeError> {
+            let mut bufs = bufs.into();
+            if self.mode.load(Ordering::Relaxed) == 1 {
+                let mut bytes = bufs.coalesce().as_ref().to_vec();
+                bytes[1] ^= 1; // First empty frame: damage its tag, not its length prefix.
+                bufs = IoBuf::from(bytes).into();
+            }
+            self.wire
+                .lock()
+                .extend_from_slice(bufs.clone().coalesce().as_ref());
+            if self.mode.load(Ordering::Relaxed) == 2 {
+                futures::future::pending::<()>().await;
+            }
+            self.inner.send(bufs).await
+        }
+    }
+
+    fn lineage_wire(with_context: bool, mode: usize) -> Result<Vec<u8>, Error> {
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        let result = wire.clone();
+        deterministic::Runner::default().start(|context| async move {
+            let sink_mode = Arc::new(AtomicUsize::new(0));
+            let dialer_crypto = PrivateKey::from_seed(42);
+            let listener_crypto = PrivateKey::from_seed(24);
+            let (dialer_sink, listener_stream) = mocks::Channel::init_with_buffer_size(256 * 1024);
+            let (listener_sink, dialer_stream) = mocks::Channel::init_with_buffer_size(256 * 1024);
+            let listener_config = transport_config(listener_crypto.clone());
+            let listener = context.child("listener").spawn(move |context| async move {
+                listen(
+                    context,
+                    |_| async { true },
+                    listener_config,
+                    listener_stream,
+                    listener_sink,
+                )
+                .await
+            });
+            let (mut sender, _) = dial(
+                context,
+                transport_config(dialer_crypto),
+                listener_crypto.public_key(),
+                dialer_stream,
+                WireSink {
+                    inner: dialer_sink,
+                    wire: wire.clone(),
+                    mode: sink_mode.clone(),
+                },
+            )
+            .await?;
+            let (_, _, mut receiver) = listener.await.unwrap()?;
+            wire.lock().clear();
+            sink_mode.store(mode, Ordering::Relaxed);
+            let payloads = [
+                vec![],
+                vec![1; 32],
+                vec![2; 8192],
+                vec![3; MAX_MESSAGE_SIZE as usize],
+            ];
+            let ids = [Some(11), Some(22), Some(11), None];
+            if mode == 2 {
+                use futures::FutureExt as _;
+                assert!(
+                    sender
+                        .send_many_with_context(
+                            payloads
+                                .iter()
+                                .zip(ids)
+                                .map(|(bytes, id)| (IoBufs::from(IoBuf::from(bytes.clone())), id))
+                        )
+                        .now_or_never()
+                        .is_none()
+                );
+                return Ok::<(), Error>(());
+            }
+            if with_context {
+                sender.send_many_with_context(std::iter::empty()).await?;
+                assert!(wire.lock().is_empty());
+                // Oversize input must fail before encryption, leaving the next frame identical.
+                assert!(matches!(
+                    sender
+                        .send_many_with_context([
+                            (IoBufs::from(IoBuf::from(b"valid")), Some(99)),
+                            (
+                                IoBufs::from(IoBuf::from(vec![0; MAX_MESSAGE_SIZE as usize + 1])),
+                                Some(100)
+                            ),
+                        ])
+                        .await,
+                    Err(Error::SendTooLarge(_))
+                ));
+                assert!(wire.lock().is_empty());
+                sender
+                    .send_many_with_context(
+                        payloads
+                            .iter()
+                            .zip(ids)
+                            .map(|(bytes, id)| (IoBufs::from(IoBuf::from(bytes.clone())), id)),
+                    )
+                    .await?;
+            } else {
+                sender
+                    .send_many(
+                        payloads
+                            .iter()
+                            .map(|bytes| IoBufs::from(IoBuf::from(bytes.clone()))),
+                    )
+                    .await?;
+            }
+            let mut received_ids = std::collections::BTreeSet::new();
+            for expected in payloads {
+                let (bytes, id) = receiver.recv_with_context().await?;
+                assert_eq!(bytes.coalesce().as_ref(), expected);
+                let id = id.expect("enabled subscriber supplies a receive ordinal");
+                assert_ne!(id, 0);
+                assert!(received_ids.insert(id));
+            }
+            Ok::<(), Error>(())
+        })?;
+        let bytes = result.lock().clone();
+        Ok(bytes)
+    }
+
+    #[test]
+    fn test_frame_lineage_wire_equivalence_and_batched_origins() -> Result<(), Error> {
+        let capture = LineageCapture::default();
+        let wire = tracing::subscriber::with_default(capture.clone(), || lineage_wire(true, 0))?;
+        let baseline = tracing::subscriber::with_default(LineageCapture::default(), || {
+            lineage_wire(false, 0)
+        })?;
+        assert_eq!(
+            wire, baseline,
+            "tracing ordinals must not alter cipher or wire bytes"
+        );
+        let events = capture.0.lock();
+        let sends: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("stage").is_some_and(|s| s == "frame_send"))
+            .collect();
+        assert_eq!(
+            sends
+                .iter()
+                .map(|e| e["message_id"].as_str())
+                .collect::<Vec<_>>(),
+            ["11", "22", "11", "0"]
+        );
+        let received: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("stage").is_some_and(|s| s == "frame_receive"))
+            .collect();
+        assert_eq!(received.len(), 4);
+        for (send, recv) in sends.iter().zip(received) {
+            assert_eq!(send["frame_hash"], recv["frame_hash"]);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.get("stage").is_some_and(|s| s == "frame_authenticated"))
+                .count(),
+            4
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_frame_lineage_failed_authentication_and_cancelled_send_are_not_delivery() {
+        let invalid = LineageCapture::default();
+        assert!(
+            tracing::subscriber::with_default(invalid.clone(), || lineage_wire(true, 1)).is_err()
+        );
+        let events = invalid.0.lock();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.get("stage").is_some_and(|s| s == "frame_receive"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.get("stage").is_some_and(|s| s == "frame_authenticated"))
+        );
+        drop(events);
+        let cancelled = LineageCapture::default();
+        tracing::subscriber::with_default(cancelled.clone(), || lineage_wire(true, 2)).unwrap();
+        let events = cancelled.0.lock();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.get("stage").is_some_and(|s| s == "frame_send"))
+                .count(),
+            4
+        );
+        assert!(!events.iter().any(|e| {
+            e.get("stage")
+                .is_some_and(|s| s == "frame_receive" || s == "frame_authenticated")
+        }));
     }
 }

@@ -1,7 +1,10 @@
 use crate::Channel;
 use commonware_codec::{EncodeSize, Error, RangeCfg, Read, ReadExt as _, Write, varint::UInt};
 use commonware_runtime::{Buf, BufMut, BufferPool, IoBuf, IoBufs};
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 /// Data is an arbitrary message sent between peers.
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +67,9 @@ pub struct EncodedData {
 
     /// Pre-encoded data frame bytes ready for transmission.
     pub payload: IoBufs,
+
+    /// Optional process-local origin; shared by clones, never encoded.
+    pub message_id: Option<u64>,
 }
 
 impl EncodedData {
@@ -89,9 +95,21 @@ impl EncodedData {
         assert_eq!(header.len(), header_len, "data header size mismatch");
         message.prepend(header.freeze());
 
+        static NEXT_MESSAGE: AtomicU64 = AtomicU64::new(1);
+        let message_id = if tracing::enabled!(target: "lifecycle", tracing::Level::INFO) {
+            NEXT_MESSAGE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .ok()
+        } else {
+            None
+        };
+        if let Some(message_id) = message_id {
+            tracing::info!(target: "lifecycle", stage = "message_origin", message_id);
+        }
         Self {
             channel,
             payload: message,
+            message_id,
         }
     }
 }
@@ -177,5 +195,26 @@ mod tests {
         commonware_conformance::conformance_tests! {
             CodecConformance<Data>,
         }
+    }
+    #[commonware_macros::test_traced]
+    fn message_lineage_distinguishes_origins_and_preserves_fanout() {
+        deterministic::Runner::default().start(|context| async move {
+            let pool = context.network_buffer_pool();
+            let first = EncodedData::new(pool, 1, IoBuf::from(b"same bytes").into());
+            let next = EncodedData::new(pool, 1, IoBuf::from(b"same bytes").into());
+            assert!(first.message_id.is_some());
+            assert!(next.message_id.is_some());
+            assert_ne!(first.message_id, next.message_id);
+            let fanout = first.clone();
+            assert_eq!(fanout.message_id, first.message_id);
+            assert_eq!(fanout.payload.coalesce(), first.payload.clone().coalesce());
+            assert_eq!(next.payload.coalesce(), first.payload.coalesce());
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                assert_eq!(
+                    EncodedData::new(pool, 1, IoBuf::from(b"disabled").into()).message_id,
+                    None
+                );
+            });
+        });
     }
 }
