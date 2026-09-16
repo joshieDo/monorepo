@@ -7736,6 +7736,7 @@ mod tests {
         inner: T,
         context: deterministic::Context,
         pace: Duration,
+        height_one_reads: Arc<AtomicUsize>,
     }
 
     impl<T: crate::marshal::store::Blocks> crate::marshal::store::Blocks for PacedStore<T> {
@@ -7745,6 +7746,12 @@ mod tests {
         async fn put(mut self, block: Self::Block) -> Result<Self, Self::Error> {
             self.inner = self.inner.put(block).await?;
             Ok(self)
+        }
+
+        async fn put_confirmed(mut self, block: Self::Block) -> Result<(Self, bool), Self::Error> {
+            let confirmed;
+            (self.inner, confirmed) = self.inner.put_confirmed(block).await?;
+            Ok((self, confirmed))
         }
 
         async fn sync(mut self) -> Result<Self, Self::Error> {
@@ -7772,7 +7779,12 @@ mod tests {
             &self,
             id: commonware_storage::archive::Identifier<'_, <Self::Block as Digestible>::Digest>,
         ) -> Result<Option<Self::Block>, Self::Error> {
-            self.inner.get(id).await
+            let height_one = matches!(id, commonware_storage::archive::Identifier::Index(1));
+            let block = self.inner.get(id).await?;
+            if height_one && block.is_some() {
+                self.height_one_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(block)
         }
 
         async fn prune(mut self, min: Height) -> Result<Self, Self::Error> {
@@ -7907,13 +7919,51 @@ mod tests {
                 inner: finalizations_by_height,
                 context: context.child("finalizations_pacer"),
                 pace,
+                height_one_reads: Arc::new(AtomicUsize::new(0)),
             },
             PacedStore {
                 inner: finalized_blocks,
                 context: context.child("blocks_pacer"),
                 pace,
+                height_one_reads: Arc::new(AtomicUsize::new(0)),
             },
         )
+    }
+
+    #[test_traced("WARN")]
+    fn test_finalized_put_confirmation_excludes_conflicts_and_pruned_heights() {
+        deterministic::Runner::timed(Duration::from_secs(10)).start(|context| async move {
+            use crate::marshal::store::Blocks;
+            let (_, wrapper) =
+                paced_finalized_stores(&context, "confirmed-put", Duration::ZERO).await;
+            let mut store = wrapper.inner;
+            let block = make_raw_block(Sha256::hash(&[b"first"]), Height::new(1), 100);
+            let conflict = make_raw_block(Sha256::hash(&[b"conflict"]), Height::new(1), 100);
+            for (candidate, expected) in [
+                (block.clone(), true),
+                (block.clone(), false),
+                (conflict, false),
+            ] {
+                let (next, confirmed) = Blocks::put_confirmed(store, candidate).await.unwrap();
+                store = next;
+                assert_eq!(confirmed, expected);
+                assert_eq!(
+                    Blocks::get(&store, commonware_storage::archive::Identifier::Index(1))
+                        .await
+                        .unwrap(),
+                    Some(block.clone())
+                );
+            }
+            store = Blocks::prune(store, Height::new(10)).await.unwrap();
+            let (store, confirmed) = Blocks::put_confirmed(store, block).await.unwrap();
+            assert!(!confirmed);
+            assert!(
+                Blocks::get(&store, commonware_storage::archive::Identifier::Index(1))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
     }
 
     /// A slow finalized-archive sync must not block the marshal mailbox.
@@ -7955,6 +8005,7 @@ mod tests {
             };
             let (finalizations_by_height, finalized_blocks) =
                 paced_finalized_stores(&context, "paced-finalized-sync", PACE).await;
+            let height_one_reads = Arc::clone(&finalized_blocks.height_one_reads);
             let (actor, mut mailbox, _) = Actor::init(
                 context.child("actor"),
                 finalizations_by_height,
@@ -7982,6 +8033,7 @@ mod tests {
             let round = Round::new(Epoch::zero(), View::new(1));
             let block = make_raw_block(genesis.digest(), Height::new(1), 100);
             assert!(mailbox.verified(round, block.clone()).await);
+            height_one_reads.store(0, Ordering::Relaxed);
 
             // Report the finalization: the actor buffers the block into the
             // finalized archives and starts the paced 100ms sync.
@@ -8037,6 +8089,11 @@ mod tests {
             assert!(
                 dispatched >= PACE,
                 "block dispatched before the paced sync completed: {dispatched:?}"
+            );
+            assert_eq!(
+                height_one_reads.load(Ordering::Relaxed),
+                0,
+                "dispatch must reuse the accepted finalized block without decoding it"
             );
         });
     }

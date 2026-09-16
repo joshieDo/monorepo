@@ -2131,14 +2131,21 @@ where
         }
 
         // Convert block to storage format
+        let commitment = V::commitment(&block);
         let stored: V::StoredBlock = block.into();
         let round = finalization.as_ref().map(|f| f.round());
 
         // In parallel, update the finalized blocks and finalizations archives
         let finalizations_by_height = self.finalizations_by_height;
-        (self.finalized_blocks, self.finalizations_by_height) = try_join!(
+        let confirmed;
+        (
+            (self.finalized_blocks, confirmed),
+            self.finalizations_by_height,
+        ) = try_join!(
             // Update the finalized blocks archive
-            self.finalized_blocks.put(stored).map_err(BoxedError::from),
+            self.finalized_blocks
+                .put_confirmed(stored)
+                .map_err(BoxedError::from),
             // Update the finalizations archive (if provided)
             async {
                 let store = if let Some(finalization) = finalization {
@@ -2157,6 +2164,13 @@ where
         // The write above is buffered and readable before it is durable, so
         // hold dispatch at or above it until a sync covers it.
         self.dispatch_gate.defer(height);
+        if confirmed {
+            // Promote only an existing full-commitment match. Cache eviction and
+            // unsupported stores retain the archive-read fallback.
+            self.decoded_blocks
+                .lock()
+                .confirm_finalized(&commitment, height);
+        }
 
         // Update metrics and application
         if let Some(round) = round.filter(|_| height > self.tip) {

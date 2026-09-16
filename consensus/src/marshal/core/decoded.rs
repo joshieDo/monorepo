@@ -54,6 +54,18 @@ impl<C: Eq, D: Eq, B> DecodedBlocks<C, D, B> {
             .map(|entry| Arc::clone(&entry.block))
     }
 
+    /// Grant height provenance only after confirmed insertion of this block.
+    /// The caller must still gate application dispatch on archive durability.
+    pub(super) fn confirm_finalized(&mut self, commitment: &C, height: Height) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| &entry.commitment == commitment && entry.height == height)
+        {
+            entry.finalized = true;
+        }
+    }
+
     pub(super) fn prune(&mut self, height: Option<Height>) {
         self.entries
             .retain(|entry| height.map_or(entry.finalized, |height| entry.height >= height));
@@ -115,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn decoded_cache_height_requires_archive_read_and_respects_pruning() {
+    fn decoded_cache_height_requires_provenance_and_respects_pruning() {
         let mut cache = DecodedBlocks::new(3, 100);
         cache.insert(1, 1, Arc::new(1), 4, Height::new(1), false);
         assert!(cache.by_height(Height::new(1)).is_none());
@@ -130,6 +142,27 @@ mod tests {
         assert!(cache.by_digest(&1).is_none());
         assert!(cache.by_height(Height::new(3)).is_some());
         assert_eq!(cache.bytes, 4);
+    }
+
+    #[test]
+    fn decoded_cache_finalized_confirmation_requires_commitment_and_height() {
+        let mut cache = DecodedBlocks::new(1, 10);
+        let block = Arc::new(1);
+        cache.insert((1, 7), 1, Arc::clone(&block), 4, Height::new(1), false);
+        cache.confirm_finalized(&(1, 8), Height::new(1));
+        cache.confirm_finalized(&(1, 7), Height::new(2));
+        assert!(cache.by_height(Height::new(1)).is_none());
+        assert!(cache.by_height(Height::new(2)).is_none());
+        cache.confirm_finalized(&(1, 7), Height::new(1));
+        assert!(Arc::ptr_eq(
+            &cache.by_height(Height::new(1)).unwrap(),
+            &block
+        ));
+        assert_eq!(cache.bytes, 4);
+        cache.prune(Some(Height::new(2)));
+        cache.confirm_finalized(&(1, 7), Height::new(1));
+        assert!(cache.by_height(Height::new(1)).is_none());
+        assert_eq!(cache.bytes, 0);
     }
 
     #[test]
