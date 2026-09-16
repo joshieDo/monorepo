@@ -508,14 +508,14 @@ impl<
     }
 
     /// Persists our notarize vote to the journal for crash recovery.
-    #[tracing::instrument(name = "simplex.voter.handle_notarize", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "simplex.voter.handle_notarize", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %notarize.proposal.payload))]
     async fn handle_notarize(self, notarize: Notarize<S, D>) -> Self {
         self.append_journal(notarize.view(), Artifact::Notarize(notarize))
             .await
     }
 
     /// Records a notarization certificate and blocks any equivocating leader.
-    #[tracing::instrument(name = "simplex.voter.handle_notarization", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "simplex.voter.handle_notarization", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %notarization.proposal.payload))]
     async fn handle_notarization(mut self, notarization: Notarization<S, D>) -> Self {
         let lifecycle_digest = notarization.proposal.payload;
         let view = notarization.view();
@@ -554,7 +554,7 @@ impl<
     }
 
     /// Persists our finalize vote to the journal for crash recovery.
-    #[tracing::instrument(name = "simplex.voter.handle_finalize", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "simplex.voter.handle_finalize", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %finalize.proposal.payload))]
     async fn handle_finalize(self, finalize: Finalize<S, D>) -> Self {
         self.append_journal(finalize.view(), Artifact::Finalize(finalize))
             .await
@@ -566,7 +566,7 @@ impl<
     /// If a crash loses a finalization that healed the same-term finalize
     /// gate, replay restores the blocked gate (which is safe) and it heals
     /// again as soon as peers redeliver any covering finalization.
-    #[tracing::instrument(name = "simplex.voter.handle_finalization", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "simplex.voter.handle_finalization", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %finalization.proposal.payload))]
     async fn handle_finalization(mut self, finalization: Finalization<S, D>) -> Self {
         let lifecycle_digest = finalization.proposal.payload;
         let view = finalization.view();

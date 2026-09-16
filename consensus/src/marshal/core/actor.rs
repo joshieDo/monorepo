@@ -1231,7 +1231,7 @@ where
     /// is a no-op because the round is below the retention floor (and no longer
     /// is required by consensus to make progress). A duplicate delivery is also
     /// a no-op, with the handle still covering the original write's durability.
-    #[tracing::instrument(name = "marshal.persist_verified", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "marshal.persist_verified", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %block.digest()))]
     async fn persist_verified<Buf: Buffer<V>>(
         mut self: Box<Self>,
         round: Round,
@@ -1267,7 +1267,7 @@ where
     /// [`Self::try_dispatch_blocks`]).
     ///
     /// Returns true if the block was consumed as the floor anchor.
-    #[tracing::instrument(name = "marshal.ingest", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "marshal.ingest", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %block.digest()))]
     async fn ingest<Buf: Buffer<V>>(
         mut self: Box<Self>,
         block: Arc<V::Block>,
@@ -2153,7 +2153,7 @@ where
     // -------------------- Mixed Storage --------------------
 
     /// Looks for a block in cache and finalized storage by digest.
-    #[tracing::instrument(name = "marshal.find_block_in_storage", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "marshal.find_block_in_storage", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %digest))]
     async fn find_block_in_storage(
         &self,
         digest: <V::Block as Digestible>::Digest,
@@ -2170,7 +2170,7 @@ where
     }
 
     /// Looks for a block in cache and finalized storage by full consensus commitment.
-    #[tracing::instrument(name = "marshal.find_block_in_storage_by_commitment", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "marshal.find_block_in_storage_by_commitment", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %V::commitment_to_inner(commitment)))]
     async fn find_block_in_storage_by_commitment(
         &self,
         commitment: V::Commitment,
@@ -2197,7 +2197,7 @@ where
     ///
     /// This is used when we only have a digest (during gap repair following
     /// parent links).
-    #[tracing::instrument(name = "marshal.find_block_by_digest", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "marshal.find_block_by_digest", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %digest))]
     async fn find_block_by_digest<Buf: Buffer<V>>(
         &self,
         buffer: &Buf,
@@ -2213,7 +2213,7 @@ where
     ///
     /// This is used when we have a full commitment (from notarizations/finalizations).
     /// Having the full commitment may enable additional retrieval mechanisms.
-    #[tracing::instrument(name = "marshal.find_block_by_commitment", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(name = "marshal.find_block_by_commitment", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %V::commitment_to_inner(commitment)))]
     async fn find_block_by_commitment<Buf: Buffer<V>>(
         &self,
         buffer: &Buf,
