@@ -9,6 +9,31 @@ use futures::{
 use pin_project::pin_project;
 use std::{collections::BTreeMap, future::Future, pin::Pin, task::Poll};
 
+/// Record completion independently of references retaining the current tracing span.
+///
+/// Wrap the whole operation inside its instrumented scope. A suspended future does
+/// not emit completion; dropping it emits abandonment under the original parent.
+#[commonware_macros::stability(BETA)]
+pub async fn lifecycle_operation<F: Future>(future: F) -> F::Output {
+    struct Completion {
+        span: tracing::Span,
+        complete: bool,
+    }
+    impl Drop for Completion {
+        fn drop(&mut self) {
+            if self.complete {
+                tracing::info!(target: "lifecycle", parent: &self.span, stage = "operation_completed");
+            } else {
+                tracing::info!(target: "lifecycle", parent: &self.span, stage = "operation_abandoned");
+            }
+        }
+    }
+    let mut completion = Completion { span: tracing::Span::current(), complete: false };
+    let output = future.await;
+    completion.complete = true;
+    output
+}
+
 /// A future type that can be used in [Pool].
 type PooledFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -696,6 +721,70 @@ mod tests {
 
             tx.send(1usize).unwrap();
             assert_eq!(option_future.poll(&mut cx), Poll::Ready(Ok(1)));
+        });
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::lifecycle_operation;
+    use futures::{channel::oneshot, executor::block_on, future, task::noop_waker};
+    use std::{future::Future, sync::{Arc, Mutex}, task::Context};
+    use tracing::{field::{Field, Visit}, Event, Subscriber};
+    use tracing_subscriber::{layer::Context as LayerContext, prelude::*, Layer};
+
+    #[derive(Clone, Default)]
+    struct Events(Arc<Mutex<Vec<String>>>);
+    impl<S: Subscriber> Layer<S> for Events {
+        fn on_event(&self, event: &Event<'_>, _: LayerContext<'_, S>) {
+            struct Stage(Option<String>);
+            impl Visit for Stage {
+                fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+                fn record_str(&mut self, field: &Field, value: &str) {
+                    if field.name() == "stage" { self.0 = Some(value.to_owned()); }
+                }
+            }
+            let mut stage = Stage(None);
+            event.record(&mut stage);
+            if let Some(stage) = stage.0 { self.0.lock().unwrap().push(stage); }
+        }
+    }
+
+    #[test]
+    fn lifecycle_completion_survives_retained_span_and_pending_poll() {
+        let events = Events::default();
+        let subscriber = tracing_subscriber::registry().with(events.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("operation");
+            let retained = span.clone();
+            let (tx, rx) = oneshot::channel::<u32>();
+            let mut operation = Box::pin(lifecycle_operation(rx));
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            span.in_scope(|| assert!(operation.as_mut().poll(&mut cx).is_pending()));
+            assert!(events.0.lock().unwrap().is_empty());
+            tx.send(7).unwrap();
+            assert_eq!(block_on(operation), Ok(7));
+            assert_eq!(*events.0.lock().unwrap(), ["operation_completed"]);
+            drop(retained);
+            drop(span);
+            assert_eq!(events.0.lock().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn lifecycle_cancellation_emits_once_and_unpolled_future_emits_nothing() {
+        let events = Events::default();
+        let subscriber = tracing_subscriber::registry().with(events.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            drop(lifecycle_operation(future::pending::<()>()));
+            assert!(events.0.lock().unwrap().is_empty());
+            let mut operation = Box::pin(lifecycle_operation(future::pending::<()>()));
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            drop(operation);
+            assert_eq!(*events.0.lock().unwrap(), ["operation_abandoned"]);
         });
     }
 }

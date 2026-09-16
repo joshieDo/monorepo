@@ -52,6 +52,7 @@ version = "0.3"
 features = ["wasm_js"]
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 arbitrary = { workspace = true, features = ["derive"] }
 commonware-conformance.workspace = true
 commonware-invariants.workspace = true

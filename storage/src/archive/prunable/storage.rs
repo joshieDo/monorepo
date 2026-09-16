@@ -476,19 +476,22 @@ impl<T: Translator, E: Context, K: Array, V: CodecShared> Inner<T, E, K, V> {
     /// See [crate::archive::Archive::start_sync].
     #[tracing::instrument(target = "lifecycle", name = "storage.archive.start_sync", level = "debug", skip_all)]
     async fn start_sync(mut self: Box<Self>) -> Result<(Box<Self>, Handle<()>), Error> {
-        // Update metrics
-        self.syncs.inc_by(self.pending.len() as u64);
+        commonware_utils::futures::lifecycle_operation(async {
+            // Update metrics
+            self.syncs.inc_by(self.pending.len() as u64);
 
-        // Retain requested sections until a blocking sync observes their outstanding work.
-        let active = self.pending.clone();
-        self.requested.append(&mut self.pending);
+            // Retain requested sections until a blocking sync observes their outstanding work.
+            let active = self.pending.clone();
+            self.requested.append(&mut self.pending);
 
-        let handle;
-        (self.oversized, handle) = self
-            .oversized
-            .start_sync_tracked(&self.requested, &active)
-            .await?;
-        Ok((self, handle))
+            let handle;
+            (self.oversized, handle) = self
+                .oversized
+                .start_sync_tracked(&self.requested, &active)
+                .await?;
+            Ok((self, handle))
+        })
+        .await
     }
 
     /// See [crate::archive::Archive::next_gap].
