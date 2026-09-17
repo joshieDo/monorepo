@@ -64,6 +64,8 @@ roaring = "0.11.4"
 rstest.workspace = true
 
 [features]
+# Isolated benchmark observer; production builds retain an identity wrapper.
+lifecycle-task-capture = [ "std" ]
 default = [ "std" ]
 std = [
 	"ahash/runtime-rng",

@@ -1,3 +1,4 @@
+use commonware_utils::futures::lifecycle_task::{observe, Role};
 use super::{
     super::{Ask, Kind, Until},
     Config,
@@ -119,7 +120,7 @@ impl<
         sender: impl Sender<PublicKey = S::PublicKey>,
         receiver: impl Receiver<PublicKey = S::PublicKey>,
     ) -> Handle<()> {
-        spawn_cell!(self.context, self.run(voter, sender, receiver))
+        spawn_cell!(self.context, observe(Role::Resolver, self.run(voter, sender, receiver)))
     }
 
     async fn run(

@@ -1,3 +1,4 @@
+use commonware_utils::futures::lifecycle_task::{observe, Role};
 use super::{Config, Error, Mailbox, Message};
 use crate::authenticated::{
     channels::{self, Channels},
@@ -175,7 +176,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
         let mut send_handler: Handle<Result<(), Error>> = self.context.child("sender").spawn({
             let peer = peer.clone();
             let rate_limits = rate_limits.clone();
-            move |context| async move {
+            move |context| observe(Role::PeerSend, async move {
                 // Set the initial deadline (no need to send right away)
                 let mut deadline = context.current() + self.ping_frequency;
 
@@ -248,12 +249,12 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                 }
 
                 Ok(())
-            }
+            })
         });
         let mut receive_handler: Handle<Result<(), Error>> =
             self.context
                 .child("receiver")
-                .spawn(move |context| async move {
+                .spawn(move |context| observe(Role::PeerReceive, async move {
                     loop {
                         // Receive a message from the peer
                         let msg = conn_receiver.recv().await.map_err(Error::ReceiveFailed)?;
@@ -316,7 +317,7 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                             }
                         }
                     }
-                });
+                }));
 
         // Wait for one of the handlers to finish or shutdown
         let mut shutdown = self.context.stopped();

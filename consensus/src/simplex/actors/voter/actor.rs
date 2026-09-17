@@ -1,3 +1,4 @@
+use commonware_utils::futures::lifecycle_task::{observe, Role};
 use super::{
     Config, Mailbox,
     ingress::Message,
@@ -984,7 +985,7 @@ impl<
     ) -> Handle<()> {
         spawn_cell!(
             self.context,
-            self.run(batcher, resolver, vote_sender, certificate_sender)
+            observe(Role::Voter, self.run(batcher, resolver, vote_sender, certificate_sender))
         )
     }
 

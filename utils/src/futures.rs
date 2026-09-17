@@ -1,5 +1,7 @@
 //! Utilities for working with futures.
 
+commonware_macros::stability_mod!(BETA, pub mod lifecycle_task);
+
 use core::ops::{Deref, DerefMut};
 use futures::{
     StreamExt,

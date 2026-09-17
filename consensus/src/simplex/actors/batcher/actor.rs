@@ -1,3 +1,4 @@
+use commonware_utils::futures::lifecycle_task::{observe, Role};
 use super::{Config, Mailbox, Message, Round};
 use crate::{
     Epochable, Relay, Reporter, Viewable,
@@ -371,7 +372,7 @@ where
     ) -> Handle<()> {
         spawn_cell!(
             self.context,
-            self.run(voter, vote_receiver, certificate_receiver)
+            observe(Role::Batcher, self.run(voter, vote_receiver, certificate_receiver))
         )
     }
 

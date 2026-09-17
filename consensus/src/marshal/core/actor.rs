@@ -1,3 +1,4 @@
+use commonware_utils::futures::lifecycle_task::{observe, Role};
 use super::{
     Buffer, Retirement, Variant,
     acks::{PendingAck, PendingAcks},
@@ -355,7 +356,7 @@ where
         Buf: Buffer<V, PublicKey = <P::Scheme as Verifier>::PublicKey>,
     {
         let mut actor = Box::new(self);
-        spawn_cell!(actor.context, actor.run(application, buffer, resolver))
+        spawn_cell!(actor.context, observe(Role::Marshal, actor.run(application, buffer, resolver)))
     }
 
     /// Start the actor without a broadcast buffer.
