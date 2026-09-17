@@ -21,9 +21,8 @@ use std::{future::Future, sync::Arc};
 
 /// The standard variant of Marshal, which broadcasts complete blocks.
 ///
-/// This variant sends the entire block to all peers. Application-provided blocks
-/// must satisfy their wire-decoder invariants under the actor's fixed codec
-/// configuration. Cached blocks may replace decoding an identical wire encoding.
+/// This variant sends the entire block to all peers. Cached delivery reuse requires
+/// the block's explicit per-object decoder-validation provenance.
 #[derive(Default, Clone, Copy)]
 pub struct Standard<B: Block>(std::marker::PhantomData<B>);
 
@@ -31,8 +30,8 @@ impl<B> Variant for Standard<B>
 where
     B: Block,
 {
-    // Working, application, and stored blocks use the same codec configuration;
-    // their identity conversions introduce no additional decoder invariants.
+    // Identity conversions introduce no additional variant decoder invariants.
+    // The helper additionally requires B's default-off per-object provenance.
     const REUSE_CACHED_DELIVERY: bool = true;
 
     type ApplicationBlock = B;

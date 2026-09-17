@@ -4,7 +4,7 @@ use crate::simplex::{
     types::{Finalization, Notarization},
 };
 use bytes::Bytes;
-use commonware_codec::{Codec, Error};
+use commonware_codec::Error;
 use commonware_cryptography::certificate::{Scheme as CertificateScheme, Scoped};
 use commonware_utils::channel::oneshot;
 use std::sync::Arc;
@@ -14,12 +14,13 @@ use std::sync::Arc;
 /// by full commitment under the same codec configuration and still verify the
 /// certificate. Every other response follows the normal decoder, including
 /// malformed, alternate, and trailing-byte encodings.
-pub(super) fn decode_cached_delivery<B: Codec + Clone>(
+pub(super) fn decode_cached_delivery<B: crate::Block + Clone>(
     value: Bytes,
     cfg: &B::Cfg,
     cached: Option<Arc<B>>,
 ) -> Result<B, Error> {
     if let Some(block) = cached
+        && block.can_reuse_cached_encoding(cfg)
         && block.encode_size() == value.len()
         && block.encode().as_ref() == value.as_ref()
     {
@@ -105,6 +106,90 @@ mod tests {
             }
             Ok(Self(bytes))
         }
+    }
+
+    impl commonware_cryptography::Digestible for TestBlock {
+        type Digest = commonware_cryptography::sha256::Digest;
+
+        fn digest(&self) -> Self::Digest {
+            use commonware_cryptography::Hasher;
+            commonware_cryptography::Sha256::hash(&[&self.0])
+        }
+    }
+
+    impl crate::Heightable for TestBlock {
+        fn height(&self) -> Height {
+            Height::new(0)
+        }
+    }
+
+    impl crate::Block for TestBlock {
+        fn parent(&self) -> Self::Digest {
+            commonware_cryptography::Digestible::digest(self)
+        }
+
+        fn can_reuse_cached_encoding(&self, _cfg: &Self::Cfg) -> bool {
+            self.0[0] == 42
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DefaultBlock(TestBlock);
+
+    impl Write for DefaultBlock {
+        fn write(&self, buf: &mut impl BufMut) {
+            self.0.write(buf);
+        }
+    }
+
+    impl EncodeSize for DefaultBlock {
+        fn encode_size(&self) -> usize {
+            self.0.encode_size()
+        }
+    }
+
+    impl Read for DefaultBlock {
+        type Cfg = u8;
+
+        fn read_cfg(buf: &mut impl Buf, limit: &Self::Cfg) -> Result<Self, Error> {
+            let bytes = <[u8; 8]>::read_cfg(buf, &())?;
+            if bytes[0] > *limit {
+                return Err(Error::Invalid("default block", "configuration limit"));
+            }
+            Ok(Self(TestBlock(bytes)))
+        }
+    }
+
+    impl commonware_cryptography::Digestible for DefaultBlock {
+        type Digest = commonware_cryptography::sha256::Digest;
+
+        fn digest(&self) -> Self::Digest {
+            use commonware_cryptography::Hasher;
+            commonware_cryptography::Sha256::hash(&[&self.0.0])
+        }
+    }
+
+    impl crate::Heightable for DefaultBlock {
+        fn height(&self) -> Height {
+            Height::new(0)
+        }
+    }
+
+    impl crate::Block for DefaultBlock {
+        fn parent(&self) -> Self::Digest {
+            commonware_cryptography::Digestible::digest(self)
+        }
+    }
+
+    #[test]
+    fn cached_delivery_default_standard_preserves_config_rejection() {
+        // The default Standard variant must not infer decoder validity from a
+        // locally constructed object's identity conversions or matching bytes.
+        type V = crate::marshal::standard::Standard<DefaultBlock>;
+        let block = Arc::new(DefaultBlock(TestBlock([42; 8])));
+        let cfg = V::block_cfg(&0, commonware_cryptography::Digestible::digest(&*block));
+        assert!(DefaultBlock::decode_cfg(block.encode(), &cfg).is_err());
+        assert!(decode_cached_delivery(block.encode(), &cfg, Some(block)).is_err());
     }
 
     #[test]

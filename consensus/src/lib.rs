@@ -61,6 +61,17 @@ stability_scope!(BETA {
     pub trait Block: Heightable + Codec + Digestible + Send + Sync + 'static {
         /// Get the parent block's digest.
         fn parent(&self) -> Self::Digest;
+
+        /// Whether this object's complete encoded bytes are known to pass decoding
+        /// with `cfg`, allowing reuse when received bytes match exactly.
+        ///
+        /// This defaults to false. Implementations must preserve decoder validation
+        /// provenance across clones and invalidate it whenever the encoded contents
+        /// or effective codec configuration change. A trusted digest or a locally
+        /// constructed object alone does not establish decoder validity.
+        fn can_reuse_cached_encoding(&self, _cfg: &Self::Cfg) -> bool {
+            false
+        }
     }
 
     /// CertifiableBlock extends [Block] with consensus context information.
