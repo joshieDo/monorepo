@@ -322,9 +322,10 @@ impl<E: Spawner + BufferPooler + Clock + CryptoRng + Metrics, C: PublicKey> Acto
                                 // processing of Ping messages, causing the peer connection to
                                 // stall and potentially disconnect.
                                 let sender = senders.get_mut(&data.channel).unwrap();
+                                let queue_id = crate::lineage::queue_start("message_inbound_queue_start", None, receive_id);
                                 let feedback = sender.enqueue(channels::Inbound((peer.clone(), data.message), receive_id));
                                 if let Some(receive_id) = receive_id {
-                                    tracing::info!(target: "lifecycle", stage = "message_inbound_queue", receive_id, accepted = u64::from(feedback.accepted()));
+                                    tracing::info!(target: "lifecycle", stage = "message_inbound_queue", queue_id = queue_id.unwrap_or(0), receive_id, accepted = u64::from(feedback.accepted()));
                                 }
                             }
                             types::Message::Ping => {

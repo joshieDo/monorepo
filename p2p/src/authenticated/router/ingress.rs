@@ -213,13 +213,14 @@ impl<P: PublicKey> Messenger<P> {
         let encoded = EncodedData::new(&self.pool, channel, message);
 
         let message_id = encoded.message_id;
+        let queue_id = crate::lineage::queue_start("message_router_queue_start", message_id, None);
         let feedback = mailbox.0.enqueue(Message::Content {
             recipients,
             encoded,
             priority,
         });
         if let Some(message_id) = message_id {
-            tracing::info!(target: "lifecycle", stage = "message_router_queue", message_id, accepted = u64::from(feedback.accepted()));
+            tracing::info!(target: "lifecycle", stage = "message_router_queue", queue_id = queue_id.unwrap_or(0), message_id, accepted = u64::from(feedback.accepted()));
         }
         feedback
     }
