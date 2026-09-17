@@ -551,7 +551,7 @@ impl<
                 response,
             } => {
                 let span = info_span!(
-                    parent: span,
+                    parent: &span,
                     "simplex.resolver.deliver",
                     epoch = self.epoch.traced(),
                     view = view.traced()
@@ -801,6 +801,48 @@ mod tests {
             },
         );
         actor
+    }
+
+    #[test_async]
+    async fn delivery_retains_last_parent_after_dequeue_cancellation() {
+        use tracing_subscriber::prelude::*;
+        let runtime = deterministic::Runner::default();
+        runtime.start(|mut context| async move {
+            let Fixture { verifier, .. } = ed25519::fixture(&mut context, NAMESPACE, 4);
+            let mut actor = build_actor(context.child("actor"), verifier, TERM_LENGTH);
+            let (voter_tx, _voter_rx) = mailbox::new(context.child("voter"), NZUsize!(8));
+            let mut voter = voter::Mailbox::new(voter_tx);
+            let mut resolver = RecordingResolver::default();
+            for cancelled in [false, true] {
+                let dispatch = tracing::Dispatch::new(tracing_subscriber::registry()
+                    .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink)));
+                let queued = tracing::dispatcher::with_default(&dispatch, || {
+                    let origin = tracing::info_span!("request");
+                    let queued = origin.in_scope(tracing::Span::current);
+                    drop(origin);
+                    queued
+                });
+                let (response, receiver) = oneshot::channel();
+                let message = HandlerMessage::Deliver {
+                    span: queued,
+                    view: View::new(3),
+                    data: Bytes::new(),
+                    asks: non_empty_vec![Ask::ancestry(Kind::Notarization)],
+                    response,
+                };
+                assert!(!message.response_closed());
+                let mut receiver = Some(receiver);
+                // A requester can cancel after the actor's dequeue check.
+                if cancelled { drop(receiver.take()); }
+                tracing::dispatcher::with_default(&dispatch, || {
+                    actor.handle_resolver(message, &mut voter, &mut resolver);
+                });
+                if let Some(receiver) = receiver {
+                    assert_eq!(receiver.await.unwrap(), Outcome::Invalid);
+                }
+                assert!(resolver.outstanding().is_empty());
+            }
+        });
     }
 
     fn assert_targeted_fetch_does_not_restrict_existing_backfill(target_index: usize) {
