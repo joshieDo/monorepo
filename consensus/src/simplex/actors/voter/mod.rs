@@ -191,6 +191,7 @@ mod tests {
     /// Voter knobs for [`setup_voter`], named so call sites cannot transpose
     /// the timeouts. Tests override only the fields they exercise.
     struct VoterOptions {
+        preparation_gate: Option<actor::PreparationGate>,
         leader_timeout: Duration,
         certification_timeout: Duration,
         timeout_retry: Duration,
@@ -218,6 +219,7 @@ mod tests {
         /// beyond test duration, so only leader timeouts fire.
         fn default() -> Self {
             Self {
+                preparation_gate: None,
                 leader_timeout: Duration::from_millis(500),
                 certification_timeout: Duration::from_secs(1000),
                 timeout_retry: Duration::from_secs(1000),
@@ -311,7 +313,8 @@ mod tests {
             write_buffer: NZUsize!(10240),
             page_cache: CacheRef::from_pooler(context, PAGE_SIZE, PAGE_CACHE_SIZE),
         };
-        let (voter, mailbox) = Actor::new(context.child("actor"), voter_cfg);
+        let (mut voter, mailbox) = Actor::new(context.child("actor"), voter_cfg);
+        voter.preparation_gate = options.preparation_gate;
 
         let (resolver_sender, resolver_receiver) =
             mailbox::new(context.child("resolver_mailbox"), NZUsize!(8));
@@ -3336,6 +3339,87 @@ mod tests {
                     },
                     _ = context.sleep(Duration::from_secs(5)) => {
                         panic!("expected notarize for view 1 after journal sync");
+                    }
+                }
+            }
+        });
+    }
+
+    /// The real voter loop handles repeated unrelated messages while the one
+    /// owned metadata preparation is pending, then waits before append/publication.
+    #[test_collect_traces]
+    fn test_preparation_loop_progress_and_durability_barriers(traces: TraceStorage) {
+        use commonware_utils::channel::oneshot;
+        let executor = deterministic::Runner::timed(Duration::from_secs(20));
+        executor.start(|mut context| async move {
+            let Fixture { participants, schemes, .. } =
+                ed25519::fixture(&mut context, b"prepare-loop", 1);
+            let oracle = start_test_network_with_peers(
+                context.child("network"), participants.clone(), true,
+            ).await;
+            let pending_syncs = PendingSyncs::default();
+            let voter_context = DelayedSyncContext {
+                inner: context.child("voter"), pending: pending_syncs.clone(),
+            };
+            let (entered, prepared) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let (mut mailbox, mut batcher, _, _, _) = setup_voter(
+                &voter_context, &oracle, &participants, &schemes,
+                RoundRobin::<Sha256>::default(),
+                VoterOptions {
+                    preparation_gate: Some(actor::PreparationGate { entered, release: released }),
+                    propose_latency_ms: 200.0,
+                    propose_requests: Some(requests.clone()),
+                    leader_timeout: Duration::from_secs(10),
+                    ..Default::default()
+                },
+            ).await;
+            prepared.await.expect("actual preparation must start");
+            wait_for_request(&context, &requests, View::new(1)).await;
+            pending_syncs.arm();
+            // Sequential receipt observations require three distinct select-loop
+            // iterations, including on_start/prune, while preparation stays gated.
+            for ordinal in 1..=3 {
+                mailbox.proposal(Proposal::new(
+                    Round::new(Epoch::new(333), View::new(u64::MAX - ordinal)),
+                    View::zero(), Sha256Digest::from([0; 32]),
+                ));
+                let deadline = context.current() + Duration::from_millis(20);
+                loop {
+                    let seen = traces.get_by_level(Level::TRACE).iter()
+                        .filter(|event| event.metadata.content == "proposal outside viewport").count();
+                    if seen == ordinal as usize { break; }
+                    assert!(context.current() < deadline, "voter stopped processing unrelated messages");
+                    context.sleep(Duration::from_millis(1)).await;
+                }
+                assert_eq!(pending_syncs.calls(), 0);
+            }
+            // Let the actual application result arrive: the journal consumer
+            // must now wait for the owned preparation, not skip a None journal.
+            context.sleep(Duration::from_millis(250)).await;
+            assert_eq!(pending_syncs.calls(), 0);
+            while let Some(message) = batcher.recv().now_or_never().flatten() {
+                assert!(!matches!(message, batcher::Message::Constructed(_)),
+                    "vote published before preparation and durability");
+            }
+            release.send(()).unwrap();
+            let sync = next_pending_sync(&pending_syncs);
+            sync.blocked.await.expect("vote append must reach original sync");
+            while let Some(message) = batcher.recv().now_or_never().flatten() {
+                assert!(!matches!(message, batcher::Message::Constructed(_)),
+                    "vote published before sync completion");
+            }
+            sync.release.send(Ok(())).unwrap();
+            pending_syncs.unblock();
+            loop {
+                select! {
+                    message = batcher.recv() => {
+                        if matches!(message.unwrap(), batcher::Message::Constructed(Vote::Notarize(vote))
+                            if vote.view() == View::new(1)) { break; }
+                    },
+                    _ = context.sleep(Duration::from_secs(2)) => {
+                        panic!("vote not published after preparation and sync");
                     }
                 }
             }

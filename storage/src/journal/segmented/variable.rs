@@ -515,6 +515,30 @@ impl<E: Storage + Metrics, V: CodecShared> Journal<E, V> {
         Ok((self, offset, item_len))
     }
 
+    /// Returns whether a section has a backing blob, including an empty one.
+    /// Returns the existing prune error for a section below the retained floor.
+    pub fn contains_section(&self, section: u64) -> Result<bool, Error> {
+        Ok(self.0.manager.get(section)?.is_some())
+    }
+
+    /// Prepare a section's backing blob without appending or certifying any item.
+    ///
+    /// This performs the same open/create path used by the first append, including
+    /// backend creation durability, and preserves the prune and replay guards.
+    /// Existing contents are untouched. A durable empty section replays no items;
+    /// later appends still require their original sync before durability is claimed.
+    /// Like other owned mutations, cancellation or error drops the journal handle.
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.journal.prepare",
+        level = "debug",
+        skip_all
+    )]
+    pub async fn prepare(mut self, section: u64) -> Result<Self, Error> {
+        self.0.manager.get_or_create(section).await?;
+        Ok(self)
+    }
+
     /// Retrieves an item from `Journal` at a given `section` and `offset`.
     ///
     /// # Errors
@@ -3312,6 +3336,139 @@ mod tests {
                 assert_eq!(items[1], (10, 1000));
             }
 
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn test_prepare_empty_restart_and_append_preserve_replay() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = Config {
+                partition: "prepare-restart".into(),
+                compression: None,
+                codec_config: (),
+                page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
+                write_buffer: NZUsize!(1024),
+            };
+            let mut journal = Journal::<_, u64>::init(context.child("first"), cfg.clone())
+                .await
+                .unwrap();
+            (journal, _, _) = journal.append(1, &11).await.unwrap();
+            journal = journal.sync(1).await.unwrap();
+            journal = journal.prepare(2).await.unwrap();
+            assert_eq!(journal.size(2).unwrap(), 0);
+            drop(journal);
+            let journal = Journal::<_, u64>::init(context.child("second"), cfg.clone())
+                .await
+                .unwrap();
+            // Prepare does not certify previously stored data or clear recovery requirements.
+            let journal = journal.prepare(1).await.unwrap();
+            assert!(journal.0.unrecovered.contains(&1));
+            assert!(!journal.0.unrecovered.contains(&2));
+            let mut replay = journal
+                .replay(0, 0, NZUsize!(1024), ReadOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(replay.next().await.unwrap().unwrap().3, 11);
+            assert!(replay.next().await.is_none());
+            let mut journal = replay.finish().unwrap();
+            let offset;
+            (journal, offset, _) = journal.append(2, &22).await.unwrap();
+            assert_eq!(offset, 0);
+            journal = journal.sync(2).await.unwrap();
+            drop(journal);
+            let journal = Journal::<_, u64>::init(context.child("third"), cfg)
+                .await
+                .unwrap();
+            let mut replay = journal
+                .replay(0, 0, NZUsize!(1024), ReadOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(replay.next().await.unwrap().unwrap().3, 11);
+            assert_eq!(replay.next().await.unwrap().unwrap().3, 22);
+            assert!(replay.next().await.is_none());
+            replay.finish().unwrap().destroy().await.unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn test_prepare_pruned_section_cannot_reappear() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = Config {
+                partition: "prepare-prune".into(),
+                compression: None,
+                codec_config: (),
+                page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
+                write_buffer: NZUsize!(1024),
+            };
+            let journal = Journal::<_, u64>::init(context.child("first"), cfg.clone())
+                .await
+                .unwrap();
+            let journal = journal.prepare(1).await.unwrap().prepare(2).await.unwrap();
+            let (journal, removed) = journal.prune(2).await.unwrap();
+            assert!(removed);
+            assert!(matches!(
+                journal.prepare(1).await,
+                Err(Error::AlreadyPrunedToSection(2))
+            ));
+            assert_eq!(
+                context.scan(&cfg.partition).await.unwrap(),
+                vec![2u64.to_be_bytes().to_vec()]
+            );
+            let journal = Journal::<_, u64>::init(context.child("reopen"), cfg)
+                .await
+                .unwrap();
+            let mut replay = journal
+                .replay(0, 0, NZUsize!(1024), ReadOptions::default())
+                .await
+                .unwrap();
+            assert!(replay.next().await.is_none());
+            replay.finish().unwrap().destroy().await.unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn test_prepare_cancelled_owner_leaves_no_replayed_artifact() {
+        use commonware_runtime::Spawner as _;
+        use commonware_utils::channel::oneshot;
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = Config {
+                partition: "prepare-cancel".into(),
+                compression: None,
+                codec_config: (),
+                page_cache: CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE),
+                write_buffer: NZUsize!(1024),
+            };
+            let journal = Journal::<_, u64>::init(context.child("first"), cfg.clone())
+                .await
+                .unwrap();
+            let (ready, observed) = oneshot::channel();
+            let task = context.child("preparation").spawn(move |_| async move {
+                let journal = journal.prepare(9).await.unwrap();
+                ready.send(()).unwrap();
+                // Cancel at the completed-metadata/owned-handoff boundary. No item
+                // was appended. Runtime dropped-open tests cover cancellation inside IO.
+                std::future::pending::<()>().await;
+                journal
+            });
+            observed.await.unwrap();
+            task.abort();
+            assert!(task.await.is_err());
+            let journal = Journal::<_, u64>::init(context.child("reopen"), cfg)
+                .await
+                .unwrap();
+            assert_eq!(journal.size(9).unwrap(), 0);
+            let mut replay = journal
+                .replay(0, 0, NZUsize!(1024), ReadOptions::default())
+                .await
+                .unwrap();
+            assert!(replay.next().await.is_none());
+            let mut journal = replay.finish().unwrap();
+            (journal, _, _) = journal.append(9, &99).await.unwrap();
+            journal = journal.sync(9).await.unwrap();
             journal.destroy().await.unwrap();
         });
     }

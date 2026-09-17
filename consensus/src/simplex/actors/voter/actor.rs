@@ -109,6 +109,87 @@ impl<'a, V: Viewable, R> Future for Waiter<'a, V, R> {
     }
 }
 
+/// Gates the actual preparation future in actor-loop durability tests.
+#[cfg(test)]
+pub(super) struct PreparationGate {
+    pub entered: oneshot::Sender<()>,
+    pub release: oneshot::Receiver<()>,
+}
+
+/// One supervised preparation owns the journal until its next consumer needs it.
+/// Cancellation of the waiter or actor aborts the task; it cannot become detached.
+struct JournalPreparation<T: Send + 'static>(Option<Handle<T>>);
+
+impl<T: Send + 'static> JournalPreparation<T> {
+    async fn finish(mut self) -> T {
+        let value = self
+            .0
+            .as_mut()
+            .expect("preparation missing")
+            .await
+            .expect("journal preparation task failed");
+        self.0.take();
+        value
+    }
+}
+
+impl<T: Send + 'static> Drop for JournalPreparation<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl<E, V> JournalPreparation<Journal<E, V>>
+where
+    E: Storage + Metrics + Spawner,
+    V: commonware_codec::CodecShared + 'static,
+{
+    fn start(
+        context: impl FnOnce() -> E,
+        ready: &mut Option<Journal<E, V>>,
+        preparation: &mut Option<Self>,
+        views: [Option<View>; 2],
+        span: impl FnOnce(View) -> Span,
+        #[cfg(test)] gate: &mut Option<PreparationGate>,
+    ) {
+        if preparation.is_some() {
+            return;
+        }
+        let Some(journal) = ready.as_ref() else {
+            return;
+        };
+        // size() is deliberately insufficient: both absent and prepared-empty
+        // sections have size zero. The actual backing-map membership is required.
+        let view = views
+            .into_iter()
+            .flatten()
+            .filter(|view| matches!(journal.contains_section(view.get()), Ok(false)))
+            .min();
+        let Some(view) = view else { return };
+        let journal = ready.take().expect("journal just observed");
+        let span = span(view);
+        #[cfg(test)]
+        let gate = gate.take();
+        let task = context().spawn(move |_| async move {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.entered
+                    .send(())
+                    .expect("test preparation observer dropped");
+                gate.release.await.expect("test preparation gate dropped");
+            }
+            journal
+                .prepare(view.get())
+                .instrument(span)
+                .await
+                .expect("unable to prepare journal")
+        });
+        *preparation = Some(Self(Some(task)));
+    }
+}
+
 /// Actor responsible for driving participation in the consensus protocol.
 pub struct Actor<
     E: BufferPooler + Clock + CryptoRng + Spawner + Storage + Metrics,
@@ -134,6 +215,9 @@ pub struct Actor<
     write_buffer: NonZeroUsize,
     page_cache: CacheRef,
     journal: Option<Journal<E, Artifact<S, D>>>,
+    journal_preparation: Option<JournalPreparation<Journal<E, Artifact<S, D>>>>,
+    #[cfg(test)]
+    pub(super) preparation_gate: Option<PreparationGate>,
     dirty_section: Option<View>,
 
     mailbox_receiver: mailbox::Receiver<Message<S, D>>,
@@ -196,6 +280,9 @@ impl<
                 write_buffer: cfg.write_buffer,
                 page_cache: cfg.page_cache,
                 journal: None,
+                journal_preparation: None,
+                #[cfg(test)]
+                preparation_gate: None,
                 dirty_section: None,
 
                 mailbox_receiver,
@@ -220,6 +307,32 @@ impl<
         Some(elapsed.as_secs_f64())
     }
 
+    async fn finish_journal_preparation(&mut self) {
+        if let Some(preparation) = self.journal_preparation.take() {
+            assert!(self.journal.is_none());
+            self.journal = Some(preparation.finish().instrument(
+                tracing::debug_span!(target: "lifecycle", "simplex.voter.journal.wait_prepare")
+            ).await);
+        }
+    }
+
+    /// Prepare only an already-dispatched request's section, one owned task at a time.
+    /// Pruning and append must recover this same journal before touching it.
+    fn start_journal_preparation(&mut self, views: [Option<View>; 2]) {
+        JournalPreparation::start(
+            || self.context.child("journal_prepare"),
+            &mut self.journal,
+            &mut self.journal_preparation,
+            views,
+            |view| {
+                tracing::debug_span!(target: "lifecycle", parent: self.state.view_span(view),
+                    "simplex.voter.journal.prepare", epoch = self.state.epoch().traced(), view = view.traced())
+            },
+            #[cfg(test)]
+            &mut self.preparation_gate,
+        );
+    }
+
     /// Drops views and journal entries that are below the activity floor.
     async fn prune_views(mut self) -> Self {
         let removed = self.state.prune();
@@ -234,6 +347,7 @@ impl<
             );
         }
         let min_active = self.state.min_active();
+        self.finish_journal_preparation().await;
         if self.journal.is_some() {
             let span = info_span!(
                 "simplex.voter.journal.prune",
@@ -255,6 +369,7 @@ impl<
     /// iteration target the view being processed and are synced together by
     /// [Self::sync_journal].
     async fn append_journal(mut self, view: View, artifact: Artifact<S, D>) -> Self {
+        self.finish_journal_preparation().await;
         if self.journal.is_some() {
             rebind(&mut self.journal, |journal| {
                 journal.append(view.get(), &artifact)
@@ -283,6 +398,7 @@ impl<
         let Some(view) = self.dirty_section else {
             return self;
         };
+        self.finish_journal_preparation().await;
         let span = info_span!(
             "simplex.voter.journal.sync",
             epoch = self.state.epoch().traced(),
@@ -301,7 +417,12 @@ impl<
     ///
     /// Callers must first sync pending journal appends. Otherwise a restart may
     /// forget the vote and sign a conflicting one, allowing conflicting certificates.
-    #[tracing::instrument(name = "simplex.voter.publish_vote", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "simplex.voter.publish_vote",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn publish_vote<T: Sender>(
         &mut self,
         batcher: &mut batcher::Mailbox<S, D>,
@@ -321,9 +442,13 @@ impl<
         self.outbound_messages.get_or_create(metric).inc();
 
         match &vote {
-            Vote::Notarize(vote) => tracing::info!(target: "lifecycle", stage = "notarize_vote_sent", block_hash = %vote.proposal.payload),
-            Vote::Finalize(vote) => tracing::info!(target: "lifecycle", stage = "finalize_vote_sent", block_hash = %vote.proposal.payload),
-            Vote::Nullify(_) => {},
+            Vote::Notarize(vote) => {
+                tracing::info!(target: "lifecycle", stage = "notarize_vote_sent", block_hash = %vote.proposal.payload)
+            }
+            Vote::Finalize(vote) => {
+                tracing::info!(target: "lifecycle", stage = "finalize_vote_sent", block_hash = %vote.proposal.payload)
+            }
+            Vote::Nullify(_) => {}
         }
         // Broadcast vote
         sender.send(Recipients::All, vote, true);
@@ -333,7 +458,12 @@ impl<
     ///
     /// Callers must sync pending journal appends first (via [Self::sync_journal])
     /// so any state we advertise to the network survives a restart.
-    #[tracing::instrument(name = "simplex.voter.broadcast_certificate", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "simplex.voter.broadcast_certificate",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn broadcast_certificate<T: Sender>(
         &mut self,
         sender: &mut WrappedSender<T, Certificate<S, D>>,
@@ -361,7 +491,12 @@ impl<
 
     /// Attempt to propose a new block.
     #[allow(clippy::async_yields_async)]
-    #[tracing::instrument(name = "simplex.voter.try_propose", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "simplex.voter.try_propose",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     async fn try_propose(&mut self) -> Option<Request<Context<D, S::PublicKey>, D>> {
         // Check if we are ready to propose
         let context = self.state.try_propose()?;
@@ -384,7 +519,12 @@ impl<
 
     /// Attempt to verify a proposed block.
     #[allow(clippy::async_yields_async)]
-    #[tracing::instrument(name = "simplex.voter.try_verify", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "simplex.voter.try_verify",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     async fn try_verify(
         &mut self,
         resolver: &mut resolver::Mailbox<S, D>,
@@ -533,7 +673,12 @@ impl<
     ///
     /// If certification succeeds, the proposal can be used in future views. If it fails, we
     /// should nullify the view as fast as possible.
-    #[tracing::instrument(name = "simplex.voter.handle_certification", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "simplex.voter.handle_certification",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     async fn handle_certification(
         mut self,
         view: View,
@@ -687,7 +832,12 @@ impl<
     /// Processes the automaton's response to a proposal request.
     ///
     /// Returns the view to notify if the proposal was recorded.
-    #[tracing::instrument(name = "simplex.voter.process_proposed", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "simplex.voter.process_proposed",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn process_proposed(
         &mut self,
         context: Context<D, S::PublicKey>,
@@ -738,7 +888,12 @@ impl<
     /// Processes the automaton's response to a verification request.
     ///
     /// Returns the view to notify.
-    #[tracing::instrument(name = "simplex.voter.process_verified", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "simplex.voter.process_verified",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     fn process_verified(
         &mut self,
         context: Context<D, S::PublicKey>,
@@ -770,7 +925,12 @@ impl<
     /// pruned) and, if the result was recorded, the certification outcome to
     /// stage for [Self::notify].
     #[allow(clippy::type_complexity)]
-    #[tracing::instrument(name = "simplex.voter.process_certified", target = "lifecycle", level = "debug", skip_all)]
+    #[tracing::instrument(
+        name = "simplex.voter.process_certified",
+        target = "lifecycle",
+        level = "debug",
+        skip_all
+    )]
     async fn process_certified(
         mut self,
         round: Rnd,
@@ -1183,6 +1343,14 @@ impl<
                 // delaying them.
                 self = self.prune_views().await;
 
+                // Application work is already running. Empty-section preparation
+                // owns one supervised task, and must not delay the preceding
+                // iteration's append/sync/publication by starting in on_end.
+                self.start_journal_preparation([
+                    pending_propose.as_ref().map(Request::view),
+                    pending_verify.as_ref().map(Request::view),
+                ]);
+
                 // Prepare waiters
                 let propose_wait = Waiter(&mut pending_propose);
                 let verify_wait = Waiter(&mut pending_verify);
@@ -1342,12 +1510,142 @@ impl<
             },
         }
 
-        // Sync and drop the journal
+        // Sync and drop the journal, including any owned preparation.
+        self.finish_journal_preparation().await;
         self.journal
             .take()
             .expect("journal missing on voter exit")
             .sync_all()
             .await
             .expect("unable to sync journal");
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::JournalPreparation;
+    use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _, deterministic};
+    use commonware_utils::channel::oneshot;
+
+    struct Dropped(Option<oneshot::Sender<()>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn preparation_owner_and_cancelled_waiter_abort_owned_task() {
+        for cancel_waiter in [false, true] {
+            deterministic::Runner::default().start(|context| async move {
+                let (started, observed) = oneshot::channel();
+                let (dropped, dropped_observed) = oneshot::channel();
+                let task = context.child("prepare").spawn(move |_| async move {
+                    let _drop = Dropped(Some(dropped));
+                    started.send(()).unwrap();
+                    std::future::pending::<u64>().await
+                });
+                let owned = JournalPreparation(Some(task));
+                observed.await.unwrap();
+                // This ownership fixture checks the supervisor can still run
+                // another task; voter-loop progress is tested separately.
+                let unrelated = context.child("unrelated").spawn(|_| async { 17u64 });
+                assert_eq!(unrelated.await.unwrap(), 17);
+                if cancel_waiter {
+                    let mut finish = Box::pin(owned.finish());
+                    assert!(futures::poll!(&mut finish).is_pending());
+                    drop(finish);
+                } else {
+                    drop(owned);
+                }
+                dropped_observed.await.unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn preparation_start_uses_real_section_membership_and_one_owned_task() {
+        use super::View;
+        use commonware_runtime::buffer::paged::CacheRef;
+        use commonware_storage::journal::segmented::variable::{Config, Journal};
+        use commonware_utils::{NZU16, NZUsize};
+        deterministic::Runner::default().start(|context| async move {
+            let cfg = Config {
+                partition: "actor-prepare".into(),
+                compression: None,
+                codec_config: (),
+                page_cache: CacheRef::from_pooler(&context, NZU16!(1024), NZUsize!(10)),
+                write_buffer: NZUsize!(1024),
+            };
+            let mut journal = Some(
+                Journal::<_, u64>::init(context.child("journal"), cfg)
+                    .await
+                    .unwrap(),
+            );
+            let mut preparation = None;
+            assert_eq!(journal.as_ref().unwrap().size(7).unwrap(), 0);
+            assert!(!journal.as_ref().unwrap().contains_section(7).unwrap());
+            JournalPreparation::start(
+                || context.child("first"),
+                &mut journal,
+                &mut preparation,
+                [Some(View::new(7)), Some(View::new(7))],
+                |_| tracing::Span::none(),
+                &mut None,
+            );
+            assert!(
+                journal.is_none() && preparation.is_some(),
+                "missing section must start preparation"
+            );
+            JournalPreparation::start(
+                || context.child("second"),
+                &mut journal,
+                &mut preparation,
+                [Some(View::new(8)), None],
+                |_| panic!("only one preparation may own journal"),
+                &mut None,
+            );
+            journal = Some(preparation.take().unwrap().finish().await);
+            assert!(journal.as_ref().unwrap().contains_section(7).unwrap());
+            assert_eq!(journal.as_ref().unwrap().size(7).unwrap(), 0);
+            assert!(!journal.as_ref().unwrap().contains_section(8).unwrap());
+            JournalPreparation::start(
+                || context.child("already_empty"),
+                &mut journal,
+                &mut preparation,
+                [Some(View::new(7)), None],
+                |_| panic!("prepared empty section must not start again"),
+                &mut None,
+            );
+            assert!(journal.is_some() && preparation.is_none());
+            let (pruned, removed) = journal.take().unwrap().prune(8).await.unwrap();
+            assert!(removed);
+            journal = Some(pruned);
+            JournalPreparation::start(
+                || context.child("pruned"),
+                &mut journal,
+                &mut preparation,
+                [Some(View::new(7)), None],
+                |_| panic!("pruned section must not reappear"),
+                &mut None,
+            );
+            assert!(preparation.is_none());
+            journal.take().unwrap().destroy().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn preparation_handoff_returns_exact_owned_value() {
+        deterministic::Runner::default().start(|context| async move {
+            let (returned, observed) = oneshot::channel();
+            let task = context
+                .child("prepare")
+                .spawn(move |_| async move { returned });
+            let owned = JournalPreparation(Some(task));
+            owned.finish().await.send(17u64).unwrap();
+            assert_eq!(observed.await.unwrap(), 17);
+        });
     }
 }
