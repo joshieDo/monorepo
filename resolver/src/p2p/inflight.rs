@@ -15,7 +15,7 @@ where
     P: PublicKey,
 {
     /// Resolver-agnostic delivery state shared with non-P2P resolver implementations.
-    deliveries: Tracker<Con, (P, Duration, usize), histogram::Timer>,
+    deliveries: Tracker<Con, (P, Duration, usize, Option<u64>), histogram::Timer>,
 }
 
 impl<Con, P> Inflight<Con, P>
@@ -80,14 +80,21 @@ where
         peer: P,
         elapsed: Duration,
         value: Con::Value,
+        receive_id: Option<u64>,
     ) {
+        let delivery = response_context(delivery, receive_id);
         self.deliveries
-            .deliver(delivery, (peer, elapsed, value.len()), value);
+            .deliver(delivery, (peer, elapsed, value.len(), receive_id), value);
     }
 
     /// Begin another consumer delivery for an already received response.
     pub(super) fn redeliver(&mut self, delivery: Delivery<Con::Key, Con::Subscriber>) {
-        self.deliveries.redeliver(delivery);
+        let receive_id = self
+            .deliveries
+            .response_context(&delivery.key)
+            .and_then(|context| context.3);
+        self.deliveries
+            .redeliver(response_context(delivery, receive_id));
     }
 
     /// Returns whether the current response has already been accepted by the consumer.
@@ -132,6 +139,20 @@ where
     }
 }
 
+/// Preserve request ancestry while attaching the exact response to each subscriber.
+/// These spans describe retained context, not service or queue duration.
+fn response_context<K, S>(mut delivery: Delivery<K, S>, receive_id: Option<u64>) -> Delivery<K, S> {
+    if let Some(receive_id) = receive_id.filter(|id| *id != 0) {
+        for (_, request) in delivery.subscribers.iter_mut() {
+            let context = tracing::debug_span!(target: "lifecycle", parent: &*request, "resolver.response.context", receive_id);
+            if !context.is_disabled() {
+                *request = context;
+            }
+        }
+    }
+    delivery
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +189,133 @@ mod tests {
             key,
             subscribers: non_empty_vec![((), tracing::Span::none())],
         }
+    }
+
+    #[test]
+    fn response_lineage_follows_cached_bytes_across_redelivery_and_replacement() {
+        use commonware_utils::sync::Mutex;
+        use std::sync::Arc;
+        use tracing::{
+            Subscriber,
+            field::{Field, Visit},
+            span::{Attributes, Id},
+        };
+        use tracing_subscriber::{
+            Layer,
+            layer::{Context as LayerContext, SubscriberExt},
+        };
+        type CapturedContexts = Vec<(u64, Option<u64>)>;
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<CapturedContexts>>);
+        struct Ordinal(Option<u64>);
+        impl Visit for Ordinal {
+            fn record_debug(&mut self, _: &Field, _: &dyn core::fmt::Debug) {}
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                if field.name() == "receive_id" {
+                    self.0 = Some(value);
+                }
+            }
+        }
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_new_span(&self, attrs: &Attributes<'_>, _: &Id, _: LayerContext<'_, S>) {
+                if attrs.metadata().name() != "resolver.response.context" {
+                    return;
+                }
+                let mut ordinal = Ordinal(None);
+                attrs.record(&mut ordinal);
+                self.0
+                    .lock()
+                    .push((ordinal.0.unwrap(), attrs.parent().map(Id::into_u64)));
+            }
+        }
+        let capture = Capture::default();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                Runner::default().start(|context| async move {
+                    let timed = make_timed(&context);
+                    let (consumer, mut received) = MockConsumer::<MockKey, Bytes>::new();
+                    let mut inflight: TestInflight = Inflight::new(consumer);
+                    let key = MockKey(1);
+                    inflight.insert(key.clone(), timed.timer(&context));
+                    let request = tracing::debug_span!("request");
+                    let parent_id = request.id().unwrap().into_u64();
+                    let make_delivery = || Delivery {
+                        key: key.clone(),
+                        subscribers: non_empty_vec![((), request.clone())],
+                    };
+                    inflight.deliver(
+                        make_delivery(),
+                        pubkey(),
+                        Duration::ZERO,
+                        Bytes::from("first"),
+                        Some(11),
+                    );
+                    assert_eq!(
+                        inflight.next_delivery().await.unwrap().4,
+                        Some(Outcome::Complete)
+                    );
+                    assert_eq!(received.recv().await.unwrap().1, Bytes::from("first"));
+                    inflight.accept_response(&key, &context);
+                    // A newly supplied subscriber gets the original response's ordinal.
+                    inflight.redeliver(make_delivery());
+                    assert_eq!(
+                        inflight.next_delivery().await.unwrap().4,
+                        Some(Outcome::Complete)
+                    );
+                    assert_eq!(received.recv().await.unwrap().1, Bytes::from("first"));
+                    inflight.discard_response(&key);
+                    assert!(inflight.deliveries.response_context(&key).is_none());
+                    inflight.deliver(
+                        make_delivery(),
+                        pubkey(),
+                        Duration::ZERO,
+                        Bytes::from("second"),
+                        Some(22),
+                    );
+                    assert_eq!(
+                        inflight.next_delivery().await.unwrap().4,
+                        Some(Outcome::Complete)
+                    );
+                    assert_eq!(received.recv().await.unwrap().1, Bytes::from("second"));
+                    assert_eq!(
+                        *capture.0.lock(),
+                        [
+                            (11, Some(parent_id)),
+                            (11, Some(parent_id)),
+                            (22, Some(parent_id))
+                        ]
+                    );
+                    assert!(inflight.cancel(&key));
+                    assert!(inflight.deliveries.response_context(&key).is_none());
+                    // Absent and zero metadata leave existing ancestry unchanged.
+                    for receive_id in [None, Some(0)] {
+                        let delivered = response_context(make_delivery(), receive_id);
+                        assert_eq!(delivered.subscribers.first().1.id(), request.id());
+                    }
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn filtered_response_context_preserves_request_span() {
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                meta.name() != "resolver.response.context"
+            }));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            let request = tracing::debug_span!("request");
+            assert!(request.id().is_some());
+            let delivery = Delivery {
+                key: MockKey(1),
+                subscribers: non_empty_vec![((), request.clone())],
+            };
+            let delivered = response_context(delivery, Some(11));
+            assert_eq!(delivered.subscribers.first().1.id(), request.id());
+        });
     }
 
     #[test]
@@ -287,6 +435,7 @@ mod tests {
                 peer.clone(),
                 Duration::from_millis(17),
                 value.clone(),
+                None,
             );
 
             let (delivered_peer, elapsed, bytes, delivered, outcome) =
@@ -320,6 +469,7 @@ mod tests {
                 peer,
                 Duration::ZERO,
                 Bytes::from("v"),
+                None,
             );
 
             // Drop the entry (and its aborter) before the delivery future is ever polled.
@@ -346,6 +496,7 @@ mod tests {
                 peer,
                 Duration::ZERO,
                 Bytes::from("v"),
+                None,
             );
 
             let (_, _, _, delivered, outcome) =
@@ -375,6 +526,7 @@ mod tests {
                 peer,
                 Duration::ZERO,
                 Bytes::from("v"),
+                None,
             );
 
             // Cancel before any poll of the pool: drops the Aborter, removes the entry.
@@ -397,7 +549,7 @@ mod tests {
             let key = MockKey(1);
 
             inflight.insert(key.clone(), timed.timer(&context));
-            inflight.deliver(delivery(key), peer, Duration::ZERO, Bytes::from("v"));
+            inflight.deliver(delivery(key), peer, Duration::ZERO, Bytes::from("v"), None);
 
             assert_eq!(inflight.drain(), 1);
 

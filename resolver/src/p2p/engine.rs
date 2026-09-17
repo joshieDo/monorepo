@@ -325,9 +325,9 @@ where
                 self.handle_serve(&mut sender, peer, id, result, self.priority_responses);
             },
             // Handle network messages
-            msg = receiver.recv() => {
+            msg = receiver.recv_with_context() => {
                 // Break if the receiver is closed
-                let (peer, msg) = match msg {
+                let ((peer, msg), receive_id) = match msg {
                     Ok(msg) => msg,
                     Err(err) => {
                         error!(?err, "receiver closed");
@@ -341,7 +341,7 @@ where
                             self.handle_network_request(peer, msg.id, key)
                         }
                         wire::Payload::Response(response) => {
-                            self.handle_network_response(peer, msg.id, response)
+                            self.handle_network_response(peer, msg.id, response, receive_id)
                         }
                         wire::Payload::Error => self.handle_network_error_response(peer, msg.id),
                     },
@@ -419,7 +419,13 @@ where
     }
 
     /// Handle a network response from a peer.
-    fn handle_network_response(&mut self, peer: P, id: u64, response: Bytes) {
+    fn handle_network_response(
+        &mut self,
+        peer: P,
+        id: u64,
+        response: Bytes,
+        receive_id: Option<u64>,
+    ) {
         trace!(?peer, ?id, "peer response: data");
 
         // Get the key associated with the response, if any
@@ -436,7 +442,8 @@ where
         let delivery = Delivery { key, subscribers };
 
         // The peer had the data, so deliver it to the consumer without blocking the engine.
-        self.inflight.deliver(delivery, peer, elapsed, response);
+        self.inflight
+            .deliver(delivery, peer, elapsed, response, receive_id);
     }
 
     /// Handle completed delivery to the consumer.
