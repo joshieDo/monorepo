@@ -195,6 +195,15 @@ where
         self.push_delivery(delivery, context, value);
     }
 
+    /// Returns context for the exact currently retained response, including redelivery.
+    pub(crate) fn response_context(&self, key: &Con::Key) -> Option<&Context> {
+        self.entries
+            .get(key)?
+            .response
+            .as_ref()
+            .map(|response| &response.context)
+    }
+
     /// Returns true if the cached response for this key has been accepted.
     pub fn response_accepted(&self, key: &Con::Key) -> bool {
         self.entries

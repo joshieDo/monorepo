@@ -28,6 +28,9 @@ pub const fn wrap<S: Sender, R: Receiver, V: Codec>(
 /// Tuple representing a message received from a given public key.
 pub type WrappedMessage<P, V> = (P, Result<V, Error>);
 
+/// Decoded message paired with optional process-local frame tracing context.
+pub type WrappedMessageWithContext<P, V> = (WrappedMessage<P, V>, Option<u64>);
+
 /// Wrapper around a [Sender] that encodes messages using a [Codec].
 #[derive(Clone)]
 pub struct WrappedSender<S: Sender, V: Codec> {
@@ -131,13 +134,23 @@ impl<R: Receiver, V: Codec> WrappedReceiver<R, V> {
     }
 
     /// Receive a message from an arbitrary recipient.
+    pub async fn recv(&mut self) -> Result<WrappedMessage<R::PublicKey, V>, R::Error> {
+        self.recv_with_context().await.map(|(message, _)| message)
+    }
+
+    /// Receive a decoded message and its optional process-local frame ordinal.
+    ///
+    /// The ordinal is local tracing context, not protocol data or a peer identity.
+    /// Decode errors retain the same context; transports without context return none.
     #[tracing::instrument(
         name = "network.codec.recv",
         target = "lifecycle",
         level = "debug",
         skip_all
     )]
-    pub async fn recv(&mut self) -> Result<WrappedMessage<R::PublicKey, V>, R::Error> {
+    pub async fn recv_with_context(
+        &mut self,
+    ) -> Result<WrappedMessageWithContext<R::PublicKey, V>, R::Error> {
         let ((pk, bytes), receive_id) = self.receiver.recv_with_context().await?;
         if let Some(receive_id) = receive_id {
             tracing::info!(target: "lifecycle", stage = "message_decode", receive_id);
@@ -149,10 +162,10 @@ impl<R: Receiver, V: Codec> WrappedReceiver<R, V> {
         let decoded = match result {
             Ok(decoded) => decoded,
             Err(e) => {
-                return Ok((pk, Err(e)));
+                return Ok(((pk, Err(e)), receive_id));
             }
         };
-        Ok((pk, Ok(decoded)))
+        Ok(((pk, Ok(decoded)), receive_id))
     }
 }
 
@@ -832,6 +845,30 @@ mod tests {
                 .await
                 .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
         }
+    }
+
+    #[test]
+    fn test_lineage_wrapped_context_survives_success_error_and_legacy_recv() {
+        deterministic::Runner::default().start(|_| async move {
+            let (tx, receiver) = mpsc::unbounded_channel();
+            for (bytes, id) in [
+                (IoBuf::from(7u32.encode()), 7),
+                (IoBuf::from(b"bad"), 8),
+                (IoBuf::from(9u32.encode()), 9),
+            ] {
+                tx.send(((pk(0), bytes), Some(id))).unwrap();
+            }
+            drop(tx);
+            let mut wrapped = WrappedReceiver::<_, u32>::new((), ContextReceiver { receiver });
+            let ((peer, value), id) = wrapped.recv_with_context().await.unwrap();
+            assert_eq!((peer, value.unwrap(), id), (pk(0), 7, Some(7)));
+            let ((_, value), id) = wrapped.recv_with_context().await.unwrap();
+            assert!(value.is_err());
+            assert_eq!(id, Some(8));
+            let (_, value) = wrapped.recv().await.unwrap();
+            assert_eq!(value.unwrap(), 9);
+            assert!(wrapped.recv_with_context().await.is_err());
+        });
     }
 
     #[test]
