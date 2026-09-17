@@ -24,7 +24,7 @@ pub(super) fn decode_cached_delivery<B: crate::Block + Clone>(
         && block.encode_size() == value.len()
         && block.encode().as_ref() == value.as_ref()
     {
-        return tracing::debug_span!(target: "lifecycle", "marshal.reuse_delivered_block")
+        return tracing::debug_span!(target: "lifecycle", "marshal.reuse_delivered_block", block_hash = %block.digest())
             .in_scope(|| Ok(Arc::unwrap_or_clone(block)));
     }
     B::decode_cfg(value, cfg)
@@ -79,6 +79,36 @@ mod tests {
     use bytes::{Buf, BufMut};
     use commonware_codec::{Decode, Encode, EncodeSize, Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn reuse_scope_identifies_exact_block_without_parent() {
+        use commonware_cryptography::Digestible as _;
+        use commonware_utils::sync::Mutex;
+        use tracing_subscriber::{layer::SubscriberExt as _, Layer};
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, _: &tracing::span::Id,
+                _: tracing_subscriber::layer::Context<'_, S>) {
+                if attrs.metadata().name() != "marshal.reuse_delivered_block" { return; }
+                struct Fields<'a>(&'a mut Vec<String>);
+                impl tracing::field::Visit for Fields<'_> {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        if field.name() == "block_hash" { self.0.push(format!("{value:?}")); }
+                    }
+                }
+                attrs.record(&mut Fields(&mut self.0.lock()));
+            }
+        }
+        let block = TestBlock([42, 1, 2, 3, 4, 5, 6, 7]);
+        let expected = block.digest().to_string();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(observed.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(decode_cached_delivery(block.encode(), &Arc::new(AtomicUsize::new(0)),
+                Some(Arc::new(block.clone()))).unwrap(), block);
+        });
+        assert_eq!(*observed.lock(), vec![expected]);
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestBlock([u8; 8]);
