@@ -68,16 +68,20 @@ impl Storage {
         &self,
         f: impl FnOnce() -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let guard = self.lock.clone().lock_owned().instrument(
-            tracing::debug_span!(target: "lifecycle", "storage.metadata.lock_wait")
-        ).await;
+        let guard = self
+            .lock
+            .clone()
+            .lock_owned()
+            .instrument(tracing::debug_span!(target: "lifecycle", "storage.metadata.lock_wait"))
+            .await;
         let hold = self.hold.clone();
         let request = tracing::debug_span!(target: "lifecycle", "storage.metadata.request");
         let queue = tracing::debug_span!(target: "lifecycle", parent: &request, "storage.metadata.blocking_queue");
         let task = tokio::task::spawn_blocking(move || {
             drop(queue);
             let _request = request.enter();
-            let _operation = tracing::debug_span!(target: "lifecycle", "storage.metadata.execute").entered();
+            let _operation =
+                tracing::debug_span!(target: "lifecycle", "storage.metadata.execute").entered();
             let _hold = hold;
             let _guard = guard;
             f()
@@ -93,7 +97,12 @@ impl Storage {
 impl crate::Storage for Storage {
     type Blob = blob::Blob;
 
-    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.open", level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.metadata.open",
+        level = "debug",
+        skip_all
+    )]
     async fn open_versioned(
         &self,
         partition: &str,
@@ -156,6 +165,13 @@ impl crate::Storage for Storage {
                     // namespace does not imply its entry is durable.
                     tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_partition")
                         .in_scope(|| sync_dir(parent))?;
+                    // Matched benchmark observation: control always requires the
+                    // original root barrier. This is an attempt, not sync success.
+                    if tracing::enabled!(target: "lifecycle", tracing::Level::DEBUG) {
+                        let _observation = tracing::debug_span!(target: "lifecycle",
+                            "storage.metadata.root_proof", accepted = 0u64)
+                        .entered();
+                    }
                     tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_root")
                         .in_scope(|| sync_dir(&storage_directory))?;
 
@@ -169,9 +185,10 @@ impl crate::Storage for Storage {
                         .map_err(|_| Error::WriteFailed)?;
                     file.write_all(&region).map_err(|_| Error::WriteFailed)?;
                     tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_header")
-                        .in_scope(|| file.sync_all()).map_err(|e| {
-                        Error::BlobSyncFailed(partition.clone(), hex(&name), e.into())
-                    })?;
+                        .in_scope(|| file.sync_all())
+                        .map_err(|e| {
+                            Error::BlobSyncFailed(partition.clone(), hex(&name), e.into())
+                        })?;
                     (0, blob_version, data_offset)
                 }
             };
@@ -183,7 +200,12 @@ impl crate::Storage for Storage {
         .await
     }
 
-    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.remove", level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.metadata.remove",
+        level = "debug",
+        skip_all
+    )]
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
         super::validate_partition_name(partition)?;
 
@@ -215,7 +237,12 @@ impl crate::Storage for Storage {
         .await
     }
 
-    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.scan", level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.metadata.scan",
+        level = "debug",
+        skip_all
+    )]
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         super::validate_partition_name(partition)?;
 
