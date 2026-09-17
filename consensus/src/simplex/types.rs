@@ -1144,6 +1144,7 @@ impl<D: Digest> Proposal<D> {
 }
 
 impl<D: Digest> Write for Proposal<D> {
+    #[tracing::instrument(name = "simplex.proposal.write", target = "lifecycle", level = "debug", skip_all, fields(block_hash = %self.payload))]
     fn write(&self, writer: &mut impl BufMut) {
         self.round.write(writer);
         self.parent.write(writer);
@@ -1155,9 +1156,12 @@ impl<D: Digest> Read for Proposal<D> {
     type Cfg = ();
 
     fn read_cfg(reader: &mut impl Buf, _: &()) -> Result<Self, Error> {
+        let span = tracing::debug_span!(target: "lifecycle", "simplex.proposal.read", block_hash = tracing::field::Empty);
+        let _entered = span.enter();
         let round = Round::read(reader)?;
         let parent = View::read(reader)?;
         let payload = D::read(reader)?;
+        span.record("block_hash", tracing::field::display(&payload));
         Ok(Self {
             round,
             parent,
@@ -3050,6 +3054,113 @@ mod tests {
     };
     use commonware_parallel::Sequential;
     use commonware_utils::{Faults, N3f1, TestRng, test_rng};
+
+    #[test]
+    fn proposal_lineage_preserves_wire_and_failed_decode_semantics() {
+        use commonware_utils::sync::Mutex;
+        use std::sync::Arc;
+        use tracing::{
+            Subscriber,
+            field::{Field, Visit},
+            span::{Attributes, Id, Record},
+        };
+        use tracing_subscriber::{
+            Layer,
+            layer::{Context, SubscriberExt},
+            registry::LookupSpan,
+        };
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+        struct Fields(Option<String>);
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
+                if field.name() == "block_hash" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
+            fn on_new_span(&self, attrs: &Attributes<'_>, _: &Id, _: Context<'_, S>) {
+                let mut fields = Fields(None);
+                attrs.record(&mut fields);
+                if let Some(value) = fields.0 {
+                    self.0.lock().push((attrs.metadata().name().into(), value));
+                }
+            }
+            fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+                let mut fields = Fields(None);
+                values.record(&mut fields);
+                if let Some(value) = fields.0 {
+                    self.0
+                        .lock()
+                        .push((ctx.span(id).unwrap().name().into(), value));
+                }
+            }
+        }
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(1), View::new(2)),
+            View::new(1),
+            sample_digest(7),
+        );
+        let mut expected = Vec::new();
+        proposal.round.write(&mut expected);
+        proposal.parent.write(&mut expected);
+        proposal.payload.write(&mut expected);
+        let capture = Capture::default();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                assert_eq!(proposal.encode().as_ref(), expected);
+                assert_eq!(
+                    Proposal::<Sha256>::decode(expected.as_slice()).unwrap(),
+                    proposal
+                );
+                assert!(Proposal::<Sha256>::decode(&expected[..expected.len() - 1]).is_err());
+                let mut trailing = expected.clone();
+                trailing.push(0);
+                // A complete observed proposal is not a claim the containing message is valid.
+                assert!(Proposal::<Sha256>::decode(trailing.as_slice()).is_err());
+            },
+        );
+        let rows = capture.0.lock();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            (
+                "simplex.proposal.write".into(),
+                proposal.payload.to_string()
+            )
+        );
+        assert_eq!(
+            rows[1],
+            ("simplex.proposal.read".into(), proposal.payload.to_string())
+        );
+        assert_eq!(rows[2], rows[1]);
+        drop(rows);
+        let filtered = Capture::default();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(filtered.clone().with_filter(
+                tracing_subscriber::filter::filter_fn(|meta| {
+                    meta.name() != "simplex.proposal.read"
+                }),
+            )),
+            || {
+                let parent = tracing::debug_span!("parent", block_hash = tracing::field::Empty);
+                let _entered = parent.enter();
+                assert_eq!(
+                    Proposal::<Sha256>::decode(expected.as_slice()).unwrap(),
+                    proposal
+                );
+            },
+        );
+        assert!(
+            filtered.0.lock().is_empty(),
+            "a filtered child must not modify its ancestor"
+        );
+        // Instrumentation-disabled encoding is identical too.
+        assert_eq!(proposal.encode().as_ref(), expected);
+    }
 
     const NAMESPACE: &[u8] = b"test";
 
