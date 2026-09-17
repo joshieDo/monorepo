@@ -371,9 +371,9 @@ mod tests {
             .position(|event| {
                 event.metadata.content == content
                     && event
-                        .expect_span_at_index(0, |span| {
-                            span.expect_content_exact(span_name)?;
-                            span.expect_field_exact("view", &view)
+                        .expect_span(|span| {
+                            span.content == span_name
+                                && span.expect_field_exact("view", &view).is_ok()
                         })
                         .is_ok()
             })
@@ -3435,6 +3435,30 @@ mod tests {
                 "replacement proposal must dispatch before the view 1 nullification broadcast \
                  (replacement at {replacement}, broadcast at {broadcast})"
             );
+            // These are actual actor completion events, not reference-close order.
+            // The sync-gate regression separately proves publication cannot cross
+            // the durability barrier while that future remains pending.
+            let expected = [
+                "simplex.voter.construct",
+                "simplex.voter.reconcile",
+                "simplex.voter.publish",
+                "simplex.voter.notify",
+            ];
+            let completions: Vec<_> = traces.get_by_level(Level::INFO).iter()
+                .filter(|event| event.metadata.expect_field_exact("stage", "operation_completed").is_ok())
+                .filter(|event| event.expect_span(|span| {
+                    span.content == "simplex.voter.notify"
+                        && span.expect_field_exact("view", "1").is_ok()
+                }).is_ok())
+                .filter_map(|event| event.spans.first())
+                .filter(|span| expected.contains(&span.content.as_str()))
+                .map(|span| span.content.clone())
+                .collect();
+            assert!(completions.len() >= expected.len());
+            for (index, completion) in completions.iter().enumerate() {
+                assert_eq!(completion, expected[index % expected.len()]);
+            }
+
         });
     }
 
@@ -8573,8 +8597,11 @@ mod tests {
                     event.metadata.content == "broadcasting notarize"
                         && event
                             .expect_span_at_index(0, |span| {
-                                span.expect_content_exact("simplex.voter.notify")
+                                span.expect_content_exact("simplex.voter.publish")
                             })
+                            .is_ok()
+                        && event
+                            .expect_span(|span| span.content == "simplex.voter.notify")
                             .is_ok()
                         && event
                             .expect_span(|span| span.content == "simplex.voter.view")

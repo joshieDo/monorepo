@@ -35,7 +35,7 @@ use commonware_runtime::{
 use commonware_storage::journal::segmented::variable::{Config as JConfig, Journal};
 use commonware_utils::{
     channel::oneshot,
-    futures::{AbortablePool, rebind},
+    futures::{AbortablePool, lifecycle_operation, rebind},
 };
 use core::{future::Future, panic};
 use rand_core::CryptoRng;
@@ -44,7 +44,23 @@ use std::{
     pin::Pin,
     task::{self, Poll},
 };
-use tracing::{Instrument as _, Span, debug, info, info_span, trace, warn};
+use tracing::{Instrument as _, Span, debug, debug_span, info, info_span, trace, warn};
+
+/// End an operation independently of references retained by its children.
+/// A filtered scope must not mark its enabled ancestor completed or abandoned.
+fn voter_operation<F: Future>(span: Span, future: F) -> impl Future<Output = F::Output> {
+    // Select eagerly: an async wrapper would retain another copy-sized future
+    // state before moving it into the instrumented operation when first polled.
+    if span.is_disabled() {
+        futures::future::Either::Left(future)
+    } else {
+        futures::future::Either::Right(lifecycle_operation(future).instrument(span))
+    }
+}
+
+#[cfg(test)]
+#[path = "actor_operation_tests.rs"]
+mod operation_tests;
 
 /// Tracks which certificate type was received from the resolver in the current iteration.
 ///
@@ -1142,10 +1158,13 @@ impl<
             on_start => {
                 // Reconcile application requests before building this iteration's
                 // response waiters.
-                self.reconcile_application_requests(
-                    &mut resolver,
-                    &mut pending_propose,
-                    &mut pending_verify,
+                voter_operation(
+                    debug_span!(target: "lifecycle", "simplex.voter.reconcile"),
+                    self.reconcile_application_requests(
+                        &mut resolver,
+                        &mut pending_propose,
+                        &mut pending_verify,
+                    ),
                 ).await;
 
                 // Attempt to certify any views that we have notarizations for.
@@ -1276,12 +1295,13 @@ impl<
                     epoch = self.state.epoch().traced(),
                     view = view.traced()
                 );
-                self = async {
+                self = voter_operation(span, async {
                     // Build and record everything that became available for `view`.
                     let mut staged;
-                    (self, staged) = self
-                        .construct(&mut resolver, view, resolved)
-                        .await;
+                    (self, staged) = voter_operation(
+                        debug_span!(target: "lifecycle", "simplex.voter.construct"),
+                        self.construct(&mut resolver, view, resolved),
+                    ).await;
                     staged.nullify = nullify;
                     staged.certification = certification;
 
@@ -1289,10 +1309,13 @@ impl<
                     // can make child requests eligible. Start those requests before
                     // journal sync and publication. The next iteration polls their
                     // responses.
-                    self.reconcile_application_requests(
-                        &mut resolver,
-                        &mut pending_propose,
-                        &mut pending_verify,
+                    voter_operation(
+                        debug_span!(target: "lifecycle", "simplex.voter.reconcile"),
+                        self.reconcile_application_requests(
+                            &mut resolver,
+                            &mut pending_propose,
+                            &mut pending_verify,
+                        ),
                     ).await;
 
                     // Sync everything appended this iteration (during message
@@ -1303,17 +1326,22 @@ impl<
                     self = self.sync_journal().await;
 
                     // Broadcast everything we built (and report it to the application).
-                    self.notify(
-                        &mut batcher,
-                        &mut resolver,
-                        &mut vote_sender,
-                        &mut certificate_sender,
-                        staged,
-                    );
+                    // This publication body is synchronous: its future is immediately
+                    // ready and contains no suspension, before the next voter iteration.
+                    voter_operation(
+                        debug_span!(target: "lifecycle", "simplex.voter.publish"),
+                        async {
+                            self.notify(
+                                &mut batcher,
+                                &mut resolver,
+                                &mut vote_sender,
+                                &mut certificate_sender,
+                                staged,
+                            );
+                        },
+                    ).await;
                     self
-                }
-                .instrument(span)
-                .await;
+                }).await;
 
                 // Close the root span of any view the chain has now decided.
                 // This runs after notify so the finalization broadcast and the
