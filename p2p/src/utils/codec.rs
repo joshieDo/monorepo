@@ -319,9 +319,11 @@ where
         let (peer, decode_result, receive_id) = result;
         match decode_result {
             Ok(value) => {
+                let queue_id =
+                    crate::lineage::queue_start("message_decoded_queue_start", None, receive_id);
                 let feedback = sender.enqueue(Decoded(peer, value, receive_id));
                 if let Some(receive_id) = receive_id {
-                    tracing::info!(target: "lifecycle", stage = "message_decoded_queue", receive_id, accepted = u64::from(feedback.accepted()));
+                    tracing::info!(target: "lifecycle", stage = "message_decoded_queue", queue_id = queue_id.unwrap_or(0), receive_id, accepted = u64::from(feedback.accepted()));
                 }
             }
             Err(err) => {
