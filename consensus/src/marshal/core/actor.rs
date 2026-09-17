@@ -785,6 +785,10 @@ where
                                 PooledSync::Observed
                             });
                         }
+                        // This accepted certificate and its exact body are now local, and
+                        // subscribers have been notified. Retire only this round's fallback;
+                        // body arrival alone does not establish the required certificate.
+                        resolver.retain(move |key, _| *key != Key::Notarized { round });
                     } else {
                         debug!(?round, "notarized block unavailable locally");
                     }

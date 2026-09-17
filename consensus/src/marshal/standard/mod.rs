@@ -6182,6 +6182,82 @@ mod tests {
     }
 
     #[test_traced("WARN")]
+    fn test_standard_local_notarization_retires_only_satisfied_round() {
+        let runner = deterministic::Runner::timed(Duration::from_secs(30));
+        runner.start(|mut context| async move {
+            let Fixture { schemes, .. } =
+                bls12381_threshold_vrf::fixture::<V, _>(&mut context, NAMESPACE, NUM_VALIDATORS);
+            let round = Round::new(Epoch::zero(), View::new(1));
+            let other_round = Round::new(Epoch::zero(), View::new(2));
+            let block = make_raw_block(Sha256::hash(&[b"parent"]), Height::new(1), 100);
+            let wrong_block = make_raw_block(Sha256::hash(&[b"parent"]), Height::new(1), 101);
+            let commitment = StandardHarness::commitment(&block);
+            let notarization = StandardHarness::make_notarization(
+                Proposal::new(round, View::zero(), commitment), &schemes, QUORUM,
+            );
+            let buffer = RecordingBuffer::default();
+            let (mut mailbox, _, mut resolver, _handle) = start_standard_actor(
+                context.child("validator"), "local-notarized-retirement",
+                ConstantProvider::new(schemes[0].clone()), Application::<B>::manual_ack(),
+                Some(buffer.clone()), Start::Genesis(StandardHarness::genesis_block(NUM_VALIDATORS as u16)),
+            ).await;
+            let subscription = mailbox.subscribe_by_commitment(
+                commitment, CommitmentFallback::FetchByRound { round },
+            );
+            wait_until(&context, Duration::from_secs(5), "round fetch", || !resolver.fetches().is_empty()).await;
+            let key = handler::Key::Notarized { round };
+            let active = |resolver: &RecordingResolver| resolver.active_fetches().iter().any(|fetch| fetch.key == key);
+            assert!(active(&resolver));
+            assert!(resolver.fetch(handler::Request::notarized(other_round)).accepted());
+            assert!(resolver.fetch(handler::Request::certified_block(commitment, Height::new(1))).accepted());
+            assert!(resolver.fetch(handler::Request::finalized(Height::new(1))).accepted());
+
+            // A certificate without its exact body cannot retire retrieval.
+            StandardHarness::report_notarization(&mut mailbox, notarization.clone()).await;
+            assert!(mailbox.get_block(&commitment).await.is_none());
+            assert!(active(&resolver));
+            buffer.insert(wrong_block);
+            StandardHarness::report_notarization(&mut mailbox, notarization.clone()).await;
+            assert!(mailbox.get_block(&commitment).await.is_none());
+            assert!(active(&resolver), "a different full commitment cannot satisfy the round");
+
+            buffer.insert(block.clone());
+            StandardHarness::report_notarization(&mut mailbox, notarization.clone()).await;
+            assert!(mailbox.get_block(&commitment).await.is_some());
+            assert_eq!(subscription.await.unwrap().digest(), block.digest());
+            assert!(!active(&resolver), "locally satisfied round must stop remote fallback");
+            let remaining = resolver.active_fetches();
+            assert_eq!(remaining.len(), 3);
+            assert!(remaining.iter().any(|f| f.key == handler::Key::Notarized { round: other_round }));
+            assert!(remaining.iter().any(|f| f.key == handler::Key::Block(commitment)));
+            assert!(remaining.iter().any(|f| f.key == handler::Key::Finalized { height: Height::new(1) }));
+
+            // The existing certificate/block writes still support serving the round.
+            let (response, result) = oneshot::channel();
+            assert!(resolver.enqueue(handler::Message::Produce { key, response }).accepted());
+            assert_eq!(result.await.unwrap(), (notarization.clone(), block.clone()).encode());
+
+            // A response already queued when cancellation races must still be validated.
+            // A mismatched body is rejected despite matching locally accepted evidence.
+            let mismatched = make_raw_block(Sha256::hash(&[b"parent"]), Height::new(1), 102);
+            for (value, accepted) in [
+                ((notarization.clone(), mismatched).encode(), false),
+                ((notarization, block).encode(), true),
+            ] {
+                let (response, result) = oneshot::channel();
+                assert!(resolver.enqueue(handler::Message::Deliver {
+                    delivery: Delivery { key, subscribers: NonEmptyVec::new((
+                        handler::Annotation::Notarization { round }, tracing::Span::none(),
+                    )) }, value, response,
+                }).accepted());
+                assert_eq!(result.await.unwrap(), accepted);
+            }
+            assert!(!active(&resolver));
+            assert_eq!(resolver.active_fetches().len(), 3);
+        });
+    }
+
+    #[test_traced("WARN")]
     fn test_standard_notarized_delivery_wakes_fetch_by_round_subscriber() {
         let runner = deterministic::Runner::timed(Duration::from_secs(30));
         runner.start(|mut context| async move {
