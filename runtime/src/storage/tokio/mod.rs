@@ -1,7 +1,8 @@
-use super::{Header, Layout, hold::Hold, resolve_header, sync_dir};
+use super::{Header, Layout, hold::Hold, resolve_header, sync_dir, sync_dir_with_handle};
 use crate::{BlobVersion, BufferPool, Error};
 use commonware_formatting::{from_hex, hex};
 use std::{
+    collections::VecDeque,
     fs,
     io::{Seek as _, SeekFrom, Write as _},
     ops::RangeInclusive,
@@ -12,6 +13,52 @@ use tokio::sync::Mutex;
 use tracing::Instrument as _;
 
 mod blob;
+
+/// Bounded successful parent-directory durability observations, scoped to this hold.
+///
+/// Metadata operations own the mutex through completion, including after caller
+/// cancellation. Whole-partition removal invalidates this observation before
+/// touching the namespace. Keeping the directory open prevents inode reuse;
+/// checking its identity also detects replacement by a different directory.
+/// Like the storage hold itself, this relies on namespace changes going through
+/// the owning storage instance: external unlink/relink of the same directory
+/// does not participate in the lock and cannot be made safe by a cached path.
+#[derive(Default)]
+struct DurableParent {
+    partitions: VecDeque<(String, fs::File)>,
+}
+
+impl DurableParent {
+    fn matches(&self, partition: &str, directory: &fs::File) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if let Some((_, previous)) = self.partitions.iter().find(|(name, _)| name == partition)
+                && let (Ok(previous), Ok(current)) = (previous.metadata(), directory.metadata())
+            {
+                return previous.dev() == current.dev() && previous.ino() == current.ino();
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (partition, directory);
+        false
+    }
+
+    #[cfg(unix)]
+    fn remember(&mut self, partition: String, directory: fs::File) {
+        // FIFO eviction needs no hit-time mutation, and bounds retained FDs to 16.
+        // A miss after eviction repeats the original root sync.
+        self.invalidate(&partition);
+        if self.partitions.len() == 16 {
+            self.partitions.pop_front();
+        }
+        self.partitions.push_back((partition, directory));
+    }
+
+    fn invalidate(&mut self, partition: &str) {
+        self.partitions.retain(|(name, _)| name != partition);
+    }
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -28,12 +75,17 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+type RootSync = Arc<dyn Fn(&std::path::Path) -> Result<(), Error> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Storage {
-    lock: Arc<Mutex<()>>,
+    lock: Arc<Mutex<DurableParent>>,
     cfg: Config,
     pool: BufferPool,
     hold: Arc<Hold>,
+    #[cfg(test)]
+    root_sync: Option<RootSync>,
 }
 
 impl Storage {
@@ -52,10 +104,12 @@ impl Storage {
             )
         });
         Self {
-            lock: Arc::new(Mutex::new(())),
+            lock: Arc::new(Mutex::new(DurableParent::default())),
             cfg,
             pool,
             hold,
+            #[cfg(test)]
+            root_sync: None,
         }
     }
 
@@ -66,21 +120,25 @@ impl Storage {
     /// runtime shutdown yields [Error::Closed].
     async fn dispatch<T: Send + 'static>(
         &self,
-        f: impl FnOnce() -> Result<T, Error> + Send + 'static,
+        f: impl FnOnce(&mut DurableParent) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let guard = self.lock.clone().lock_owned().instrument(
-            tracing::debug_span!(target: "lifecycle", "storage.metadata.lock_wait")
-        ).await;
+        let guard = self
+            .lock
+            .clone()
+            .lock_owned()
+            .instrument(tracing::debug_span!(target: "lifecycle", "storage.metadata.lock_wait"))
+            .await;
         let hold = self.hold.clone();
         let request = tracing::debug_span!(target: "lifecycle", "storage.metadata.request");
         let queue = tracing::debug_span!(target: "lifecycle", parent: &request, "storage.metadata.blocking_queue");
         let task = tokio::task::spawn_blocking(move || {
             drop(queue);
             let _request = request.enter();
-            let _operation = tracing::debug_span!(target: "lifecycle", "storage.metadata.execute").entered();
+            let _operation =
+                tracing::debug_span!(target: "lifecycle", "storage.metadata.execute").entered();
             let _hold = hold;
-            let _guard = guard;
-            f()
+            let mut guard = guard;
+            f(&mut guard)
         });
         match task.await {
             Ok(result) => result,
@@ -93,7 +151,12 @@ impl Storage {
 impl crate::Storage for Storage {
     type Blob = blob::Blob;
 
-    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.open", level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.metadata.open",
+        level = "debug",
+        skip_all
+    )]
     async fn open_versioned(
         &self,
         partition: &str,
@@ -110,13 +173,15 @@ impl crate::Storage for Storage {
         let blob_layouts = self.cfg.blob_layouts.clone();
         let pool = self.pool.clone();
         let hold = self.hold.clone();
+        #[cfg(test)]
+        let root_sync = self.root_sync.clone();
 
         // Run the open to completion: it mutates the partition directory and the
         // blob (create, truncate, header write, syncs), and dropping this future
         // must not abandon that sequence half-done (a straggling truncate could
         // clobber a successor's blob) or leave a later open trusting a header
         // whose syncs never ran.
-        self.dispatch(move || {
+        self.dispatch(move |durable_parent| {
             let parent = match path.parent() {
                 Some(parent) => parent,
                 None => return Err(Error::PartitionCreationFailed(partition)),
@@ -152,12 +217,37 @@ impl crate::Storage for Storage {
                     // Sync the directories before writing the header so a parseable
                     // header always implies durable directory entries (an open that
                     // parses a header never re-runs these). The storage directory is
-                    // synced unconditionally: the partition directory existing in the
-                    // namespace does not imply its entry is durable.
-                    tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_partition")
-                        .in_scope(|| sync_dir(parent))?;
-                    tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_root")
-                        .in_scope(|| sync_dir(&storage_directory))?;
+                    // synced unless this instance has already completed that sync
+                    // for this exact still-owned partition. Existence alone is not
+                    // durability evidence. Each new blob's partition entry and
+                    // header still require their original syncs.
+                    let directory = tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_partition")
+                        .in_scope(|| sync_dir_with_handle(parent))?;
+                    let proven = durable_parent.matches(&partition, &directory);
+                    // Existing closed numeric field: accepted=1 means exact live
+                    // parent proof reused; accepted=0 means the root sync is required.
+                    // No partition identity is emitted, and no observer is created
+                    // when full lifecycle DEBUG observation is disabled.
+                    if tracing::enabled!(target: "lifecycle", tracing::Level::DEBUG) {
+                        let _observation = tracing::debug_span!(target: "lifecycle",
+                            "storage.metadata.root_proof", accepted = u64::from(proven)).entered();
+                    }
+                    if !proven {
+                        tracing::debug_span!(target: "lifecycle", "storage.metadata.sync_root")
+                            .in_scope(|| {
+                                #[cfg(test)]
+                                if let Some(sync) = root_sync {
+                                    return sync(&storage_directory);
+                                }
+                                sync_dir(&storage_directory)
+                            })?;
+                        // Remember only a completed root sync. The bounded cache
+                        // retains at most 16 descriptors; misses use the old path.
+                        #[cfg(unix)]
+                        {
+                            durable_parent.remember(partition.clone(), directory);
+                        }
+                    }
 
                     // Truncate to zero before writing, per the [Header::create] contract.
                     let (region, blob_version) = Header::create(&blob_layouts, &versions);
@@ -183,7 +273,12 @@ impl crate::Storage for Storage {
         .await
     }
 
-    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.remove", level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.metadata.remove",
+        level = "debug",
+        skip_all
+    )]
     async fn remove(&self, partition: &str, name: Option<&[u8]>) -> Result<(), Error> {
         super::validate_partition_name(partition)?;
 
@@ -195,7 +290,7 @@ impl crate::Storage for Storage {
         // Run the removal to completion: dropping this future must not abandon
         // the sequence between an unlink and the directory sync that makes it
         // durable.
-        self.dispatch(move || {
+        self.dispatch(move |durable_parent| {
             // Remove all related files
             if let Some(name) = name {
                 let blob_path = path.join(hex(&name));
@@ -205,6 +300,9 @@ impl crate::Storage for Storage {
                 // Sync the partition directory to ensure the removal is durable.
                 sync_dir(&path)?;
             } else {
+                // Invalidate even if removal fails after partially changing the
+                // directory. Recreating this name must prove root durability again.
+                durable_parent.invalidate(&partition);
                 fs::remove_dir_all(&path).map_err(|_| Error::PartitionMissing(partition))?;
 
                 // Sync the storage directory to ensure the removal is durable.
@@ -215,13 +313,18 @@ impl crate::Storage for Storage {
         .await
     }
 
-    #[tracing::instrument(target = "lifecycle", name = "storage.metadata.scan", level = "debug", skip_all)]
+    #[tracing::instrument(
+        target = "lifecycle",
+        name = "storage.metadata.scan",
+        level = "debug",
+        skip_all
+    )]
     async fn scan(&self, partition: &str) -> Result<Vec<Vec<u8>>, Error> {
         super::validate_partition_name(partition)?;
 
         let path = self.cfg.storage_directory.join(partition);
         let partition = partition.to_string();
-        self.dispatch(move || {
+        self.dispatch(move |_| {
             // Scan the partition directory
             let entries =
                 fs::read_dir(path).map_err(|_| Error::PartitionMissing(partition.clone()))?;
@@ -273,6 +376,243 @@ mod tests {
     fn random_suffix() -> u64 {
         let mut rng = sys_rng();
         rng.random()
+    }
+
+    fn counted_storage(directory: PathBuf) -> (Storage, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let mut storage = Storage::new(Config::new(directory, Layout::ALL), test_pool());
+        storage.root_sync = Some(Arc::new(move |path| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sync_dir(path)
+        }));
+        (storage, calls)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_parent_reuses_only_same_live_partition_across_clones() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let directory = env::temp_dir().join(format!("durable_parent_reuse_{}", random_suffix()));
+        let (storage, calls) = counted_storage(directory.clone());
+        drop(storage.open("partition", b"first").await.unwrap());
+        let clone = storage.clone();
+        drop(storage);
+        let (blob, length) = clone.open("partition", b"second").await.unwrap();
+        assert_eq!(length, 0);
+        blob.write_at(0, b"durable", WriteOptions::default())
+            .await
+            .unwrap();
+        blob.sync().await.unwrap();
+        drop(blob);
+        assert_eq!(calls.load(SeqCst), 1);
+        // Switching between independently growing partitions retains both proofs.
+        drop(clone.open("other", b"first").await.unwrap());
+        drop(clone.open("partition", b"third").await.unwrap());
+        assert_eq!(calls.load(SeqCst), 2);
+        drop(clone);
+        let (storage, calls) = counted_storage(directory.clone());
+        let (blob, length) = storage.open("partition", b"second").await.unwrap();
+        assert_eq!(length, 7);
+        assert_eq!(
+            blob.read_at(0, 7, ReadOptions::default())
+                .await
+                .unwrap()
+                .coalesce(),
+            b"durable"
+        );
+        drop(blob);
+        // A new instance has no inherited proof, even for an existing partition.
+        drop(storage.open("partition", b"after_restart").await.unwrap());
+        assert_eq!(calls.load(SeqCst), 1);
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_parent_alternating_partitions_preserve_proofs() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let directory =
+            env::temp_dir().join(format!("durable_parent_alternating_{}", random_suffix()));
+        let (storage, calls) = counted_storage(directory.clone());
+        // Model two independently growing journals sharing the same Storage.
+        // This is a usefulness negative control, not a measured node sequence.
+        for blob in 0u64..8 {
+            for partition in ["archive", "voter"] {
+                drop(storage.open(partition, &blob.to_be_bytes()).await.unwrap());
+            }
+        }
+        assert_eq!(calls.load(SeqCst), 2);
+        // Reopening existing, already-durable headers does not evict proof.
+        drop(storage.open("archive", &0u64.to_be_bytes()).await.unwrap());
+        drop(storage.open("voter", b"next").await.unwrap());
+        assert_eq!(calls.load(SeqCst), 2);
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_parent_capacity_eviction_repeats_original_barrier() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let directory =
+            env::temp_dir().join(format!("durable_parent_capacity_{}", random_suffix()));
+        let (storage, calls) = counted_storage(directory.clone());
+        for partition in 0..17 {
+            drop(
+                storage
+                    .open(&format!("p{partition}"), b"first")
+                    .await
+                    .unwrap(),
+            );
+            assert!(storage.lock.lock().await.partitions.len() <= 16);
+        }
+        assert_eq!(calls.load(SeqCst), 17);
+        drop(storage.open("p16", b"second").await.unwrap());
+        assert_eq!(calls.load(SeqCst), 17);
+        // The oldest proof was evicted; existence alone cannot resurrect it.
+        drop(storage.open("p0", b"second").await.unwrap());
+        assert_eq!(calls.load(SeqCst), 18);
+        assert_eq!(storage.lock.lock().await.partitions.len(), 16);
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_parent_failed_root_sync_never_writes_header_or_seeds_proof() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let directory = env::temp_dir().join(format!("durable_parent_failure_{}", random_suffix()));
+        let mut storage = Storage::new(Config::new(directory.clone(), Layout::ALL), test_pool());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        storage.root_sync = Some(Arc::new(move |path| {
+            if observed.fetch_add(1, SeqCst) == 0 {
+                return Err(Error::Closed);
+            }
+            sync_dir(path)
+        }));
+        assert!(matches!(
+            storage.open("partition", b"blob").await,
+            Err(Error::Closed)
+        ));
+        let file = directory.join("partition").join(hex(b"blob"));
+        // A failed directory barrier cannot leave a parseable header whose next
+        // open would skip the unfinished creation sequence.
+        assert_eq!(fs::metadata(&file).unwrap().len(), 0);
+        assert!(storage.lock.lock().await.partitions.is_empty());
+        drop(storage.open("partition", b"blob").await.unwrap());
+        assert_eq!(calls.load(SeqCst), 2);
+        assert_eq!(fs::metadata(file).unwrap().len(), Layout::V1.data_offset());
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_parent_removal_and_failed_removal_invalidate_before_reuse() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let directory = env::temp_dir().join(format!("durable_parent_remove_{}", random_suffix()));
+        let (storage, calls) = counted_storage(directory.clone());
+        drop(storage.open("partition", b"first").await.unwrap());
+        storage.remove("partition", None).await.unwrap();
+        drop(storage.open("partition", b"second").await.unwrap());
+        assert_eq!(calls.load(SeqCst), 2);
+        // Force a failed whole-partition removal, then restore the exact old
+        // directory inode. The failed attempt must already have invalidated it.
+        let path = directory.join("partition");
+        let moved = directory.join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"not a directory").unwrap();
+        assert!(storage.remove("partition", None).await.is_err());
+        assert!(storage.lock.lock().await.partitions.is_empty());
+        fs::remove_file(&path).unwrap();
+        fs::rename(&moved, &path).unwrap();
+        drop(storage.open("partition", b"third").await.unwrap());
+        assert_eq!(calls.load(SeqCst), 3);
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_parent_replacement_is_not_the_remembered_directory() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let directory = env::temp_dir().join(format!("durable_parent_replace_{}", random_suffix()));
+        let (storage, calls) = counted_storage(directory.clone());
+        drop(storage.open("partition", b"first").await.unwrap());
+        // An open directory descriptor pins the old identity even after removal,
+        // so a same-name recreation cannot recycle that inode into a false hit.
+        fs::remove_dir_all(directory.join("partition")).unwrap();
+        drop(storage.open("partition", b"second").await.unwrap());
+        assert_eq!(calls.load(SeqCst), 2);
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_parent_cancelled_open_keeps_barrier_and_lock_until_complete() {
+        use std::{
+            sync::{
+                atomic::{AtomicUsize, Ordering::SeqCst},
+                mpsc,
+            },
+            time::Duration,
+        };
+        let directory = env::temp_dir().join(format!("durable_parent_cancel_{}", random_suffix()));
+        let mut storage = Storage::new(Config::new(directory.clone(), Layout::ALL), test_pool());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = commonware_utils::sync::Mutex::new(release_rx);
+        storage.root_sync = Some(Arc::new(move |path| {
+            if observed.fetch_add(1, SeqCst) == 0 {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| Error::Closed)?;
+            }
+            sync_dir(path)
+        }));
+        let first = storage.clone();
+        let task = tokio::spawn(async move { first.open("partition", b"first").await });
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            fs::metadata(directory.join("partition").join(hex(b"first")))
+                .unwrap()
+                .len(),
+            0
+        );
+        let second = storage.clone();
+        let task = tokio::spawn(async move { second.open("partition", b"second").await });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        release_tx.send(()).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(calls.load(SeqCst), 1);
+        assert_eq!(
+            fs::metadata(directory.join("partition").join(hex(b"first")))
+                .unwrap()
+                .len(),
+            Layout::V1.data_offset()
+        );
+        drop(storage);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

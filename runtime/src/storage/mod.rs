@@ -51,6 +51,11 @@ stability_scope!(BETA, cfg(not(target_arch = "wasm32")) {
     /// Syncs a directory to ensure directory entry changes are durable.
     /// On Unix, directory metadata (file creation/deletion) must be explicitly fsynced.
     pub(crate) fn sync_dir(path: &Path) -> Result<(), Error> {
+        sync_dir_with_handle(path).map(drop)
+    }
+
+    /// Sync a directory and retain its identity for an owning backend.
+    pub(crate) fn sync_dir_with_handle(path: &Path) -> Result<File, Error> {
         let dir = File::open(path).map_err(|e| {
             Error::BlobOpenFailed(
                 path.to_string_lossy().to_string(),
@@ -64,7 +69,8 @@ stability_scope!(BETA, cfg(not(target_arch = "wasm32")) {
                 "directory".to_string(),
                 e.into(),
             )
-        })
+        })?;
+        Ok(dir)
     }
 
     /// Reads a blob's leading bytes and resolves its header (see [header::resolve]).
