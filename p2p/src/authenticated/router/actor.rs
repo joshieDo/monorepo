@@ -47,9 +47,11 @@ impl<E: Spawner + Metrics, P: PublicKey> Actor<E, P> {
     fn send(&mut self, recipient: P, encoded: EncodedData, priority: bool) {
         if let Some(relay) = self.connections.get_mut(&recipient) {
             let message_id = encoded.message_id;
+            let queue_id =
+                crate::lineage::queue_start("message_peer_queue_start", message_id, None);
             let feedback = relay.send(encoded, priority);
             if let Some(message_id) = message_id {
-                tracing::info!(target: "lifecycle", stage = "message_peer_queue", message_id, accepted = u64::from(feedback.accepted()));
+                tracing::info!(target: "lifecycle", stage = "message_peer_queue", queue_id = queue_id.unwrap_or(0), message_id, accepted = u64::from(feedback.accepted()));
             }
         }
     }
@@ -68,9 +70,14 @@ impl<E: Spawner + Metrics, P: PublicKey> Actor<E, P> {
             Recipients::All => {
                 // Send to all connected peers
                 for relay in self.connections.values_mut() {
+                    let queue_id = crate::lineage::queue_start(
+                        "message_peer_queue_start",
+                        encoded.message_id,
+                        None,
+                    );
                     let feedback = relay.send(encoded.clone(), priority);
                     if let Some(message_id) = encoded.message_id {
-                        tracing::info!(target: "lifecycle", stage = "message_peer_queue", message_id, accepted = u64::from(feedback.accepted()));
+                        tracing::info!(target: "lifecycle", stage = "message_peer_queue", queue_id = queue_id.unwrap_or(0), message_id, accepted = u64::from(feedback.accepted()));
                     }
                 }
             }
